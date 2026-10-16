@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "version": "1.0",
+  "label": "indicative, non-diagnostic, not a validated classifier",
+  "minimum_face_detection_ratio": 0.5,
+  "minimum_mean_luminance": 20.0,
+  "minimum_blur_variance": 10.0,
+  "minimum_temporal_coverage": 0.7,
+  "maximum_absolute_yaw_proxy": 0.35,
+  "maximum_absolute_pitch_proxy": 0.35,
+  "states": {
+    "high_risk": {"short_clip_eye_closure_fraction_at_least": 0.4, "max_eye_closure_seconds_at_least": 2.0},
+    "elevated_fatigue": {"short_clip_eye_closure_fraction_at_least": 0.2, "blink_rate_per_minute_at_least": 25.0, "mean_eye_closure_seconds_at_least": 0.5},
+    "low_focus": {"short_clip_eye_closure_fraction_at_least": 0.1, "blink_rate_per_minute_at_least": 20.0, "mean_eye_closure_seconds_at_least": 0.25}
+  },
+  "baseline_minimum_prior_scans": 5,
+  "baseline_freshness_window_days": 90
+}

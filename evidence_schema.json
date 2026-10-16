@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wellar.example/schemas/evidence/1.0/evidence_schema.json",
+  "title": "Wellar Evidence Schema v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scan_id", "schema_version", "model_versions", "modalities", "quality_scores", "missingness_flags", "fatigue", "focus", "risk_states", "abstentions", "limitations"],
+  "properties": {
+    "scan_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "schema_version": {"const": "1.0"},
+    "model_versions": {"type": "object", "additionalProperties": {"type": ["string", "null"]}},
+    "modalities": {"type": "object", "propertyNames": {"enum": ["video", "image", "audio", "reaction_task"]}, "additionalProperties": {"$ref": "#/$defs/modality"}},
+    "quality_scores": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}},
+    "missingness_flags": {"type": "array", "items": {"type": "string"}},
+    "fatigue": {"$ref": "#/$defs/outcome"},
+    "focus": {"$ref": "#/$defs/outcome"},
+    "risk_states": {"type": "object", "additionalProperties": false, "required": ["drowsiness", "fatigue", "distraction", "impairment"], "properties": {"drowsiness": {"$ref": "#/$defs/outcome"}, "fatigue": {"$ref": "#/$defs/outcome"}, "distraction": {"$ref": "#/$defs/outcome"}, "impairment": {"$ref": "#/$defs/outcome"}}},
+    "abstentions": {"type": "array", "items": {"$ref": "#/$defs/abstention"}},
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "outcome": {"type": "object", "additionalProperties": false, "required": ["status", "reason"], "properties": {"status": {"const": "insufficient_evidence"}, "reason": {"type": "string", "minLength": 1, "maxLength": 256}}},
+    "modality": {"type": "object", "additionalProperties": false, "required": ["status", "measurements", "quality_scores", "missingness_flags"], "properties": {"status": {"enum": ["available", "insufficient_quality", "missing", "not_processed"]}, "measurements": {"type": "object", "additionalProperties": {"type": ["number", "integer", "boolean", "string", "null"]}}, "quality_scores": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}}, "missingness_flags": {"type": "array", "items": {"type": "string"}}}},
+    "abstention": {"type": "object", "additionalProperties": false, "required": ["reason"], "properties": {"modality": {"enum": ["video", "image", "audio", "reaction_task", null]}, "target": {"type": ["string", "null"]}, "reason": {"type": "string", "minLength": 1, "maxLength": 256}}}
+  }
+}

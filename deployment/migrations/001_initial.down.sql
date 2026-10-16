@@ -1,0 +1,7 @@
+DROP TABLE IF EXISTS media_assets;
+DROP TABLE IF EXISTS outbox;
+DROP TABLE IF EXISTS results;
+DROP TABLE IF EXISTS jobs;
+DROP TABLE IF EXISTS scans;
+DROP INDEX IF EXISTS jobs_claim_idx;
+DROP INDEX IF EXISTS media_tenant_retention_idx;

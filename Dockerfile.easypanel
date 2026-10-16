@@ -1,0 +1,49 @@
+FROM python:3.11.13-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    WELLAR_ENV=production \
+    WELLAR_QUEUE_BACKEND=postgres \
+    WELLAR_MEDIA_BACKEND=s3 \
+    WELLAR_AUTH_MODE=oidc \
+    WELLAR_POSTGRES_AUTO_MIGRATE=false \
+    WELLAR_MODEL_INFERENCE_ENABLED=false \
+    WELLAR_RESEARCH_IMAGE_DROWSINESS_ENABLED=false \
+    HOME=/home/wellar
+
+WORKDIR /srv/wellar
+
+# OpenCV's wheel uses bundled FFmpeg for video I/O. Audio WAV parsing uses
+# Python's standard library; PortAudio is present for MediaPipe's runtime dep.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates libgl1 libglib2.0-0 libstdc++6 libgomp1 \
+       libsm6 libxext6 libxrender1 libportaudio2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system wellar \
+    && useradd --system --gid wellar --create-home wellar \
+    && mkdir -p /var/lib/wellar /tmp/wellar /home/wellar/.cache \
+    && chown -R wellar:wellar /var/lib/wellar /tmp/wellar /home/wellar
+
+ENV TMPDIR=/tmp/wellar
+
+COPY requirements-lock.txt requirements-runtime.txt ./
+RUN python -m pip install --no-cache-dir --disable-pip-version-check \
+       --constraint requirements-lock.txt --requirement requirements-runtime.txt \
+    && python -m pip check
+
+COPY --chown=wellar:wellar app ./app
+COPY --chown=wellar:wellar config ./config
+COPY --chown=wellar:wellar deployment/migrations ./deployment/migrations
+
+USER wellar:wellar
+EXPOSE 8000
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=15s --timeout=3s --start-period=45s --retries=3 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready',timeout=2)"]
+
+# API is the default command; EasyPanel's worker service overrides this with
+# `python -m app.workers.entrypoint` while reusing the same image.
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--no-access-log"]

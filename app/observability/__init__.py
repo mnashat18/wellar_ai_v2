@@ -1,0 +1,1 @@
+"""Bounded-cardinality observability primitives."""

@@ -1,0 +1,54 @@
+services:
+  api:
+    image: ${WELLAR_STAGING_IMAGE:-wellar-ai-v2:staging}
+    build:
+      context: .
+      dockerfile: Dockerfile.easypanel
+    init: true
+    restart: unless-stopped
+    env_file:
+      - ${WELLAR_STAGING_ENV_FILE:-.env.example}
+    environment:
+      WELLAR_ENV: staging
+      WELLAR_QUEUE_BACKEND: postgres
+      WELLAR_MEDIA_BACKEND: s3
+      WELLAR_AUTH_MODE: oidc
+      WELLAR_POSTGRES_AUTO_MIGRATE: "false"
+      WELLAR_MODEL_INFERENCE_ENABLED: "false"
+      WELLAR_RESEARCH_IMAGE_DROWSINESS_ENABLED: "false"
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready',timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      start_period: 45s
+      retries: 3
+    networks:
+      - wellar-staging
+
+  worker:
+    image: ${WELLAR_STAGING_IMAGE:-wellar-ai-v2:staging}
+    build:
+      context: .
+      dockerfile: Dockerfile.easypanel
+    init: true
+    restart: unless-stopped
+    env_file:
+      - ${WELLAR_STAGING_ENV_FILE:-.env.example}
+    environment:
+      WELLAR_ENV: staging
+      WELLAR_QUEUE_BACKEND: postgres
+      WELLAR_MEDIA_BACKEND: s3
+      WELLAR_AUTH_MODE: oidc
+      WELLAR_POSTGRES_AUTO_MIGRATE: "false"
+      WELLAR_MODEL_INFERENCE_ENABLED: "false"
+      WELLAR_RESEARCH_IMAGE_DROWSINESS_ENABLED: "false"
+    command: ["python", "-m", "app.workers.entrypoint"]
+    networks:
+      - wellar-staging
+
+networks:
+  wellar-staging:
+    external: true
+    name: ${WELLAR_STAGING_NETWORK:-wellar-v2-staging}
