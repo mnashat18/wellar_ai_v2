@@ -4,7 +4,10 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+
+STAGING_POSTGRES_SSL_DISABLE_ALLOWED_HOST = "continuity_wellar-v2-postgres"
 
 
 def _env_bool(name:str,default:bool)->bool:
@@ -44,6 +47,7 @@ class Settings:
     max_concurrent_uploads: int = 4
     queue_backend: str = "sqlite"
     postgres_dsn: str | None = None
+    staging_postgres_ssl_disable_ack: bool = False
     postgres_pool_min: int = 1
     postgres_pool_max: int = 10
     postgres_pool_timeout: float = 5.0
@@ -111,6 +115,7 @@ class Settings:
                 max_concurrent_uploads=int(os.getenv("WELLAR_MAX_CONCURRENT_UPLOADS", "4")),
                 queue_backend=os.getenv("WELLAR_QUEUE_BACKEND","sqlite").lower(),
                 postgres_dsn=os.getenv("WELLAR_POSTGRES_DSN"),
+                staging_postgres_ssl_disable_ack=_env_bool("WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK", False),
                 postgres_pool_min=int(os.getenv("WELLAR_POSTGRES_POOL_MIN","1")),
                 postgres_pool_max=int(os.getenv("WELLAR_POSTGRES_POOL_MAX","10")),
                 postgres_pool_timeout=float(os.getenv("WELLAR_POSTGRES_POOL_TIMEOUT","5")),
@@ -180,8 +185,18 @@ class Settings:
                 raise ValueError("staging/production OIDC issuer and JWKS URI must use HTTPS")
         if self.environment in {"staging","production"} and self.auth_mode=="directus" and urlparse(self.directus_url or "").scheme!="https":
             raise ValueError("staging/production Directus URL must use HTTPS")
-        if self.environment in {"staging","production"} and self.queue_backend=="postgres" and "sslmode=verify-full" not in (self.postgres_dsn or "").lower():
-            raise ValueError("staging/production PostgreSQL DSN must enable sslmode=verify-full")
+        if self.environment in {"staging","production"} and self.queue_backend=="postgres":
+            parsed_postgres_dsn = urlparse(self.postgres_dsn or "")
+            ssl_modes = [mode.lower() for mode in parse_qs(parsed_postgres_dsn.query, keep_blank_values=True).get("sslmode", [])]
+            if ssl_modes == ["verify-full"]:
+                pass
+            elif self.environment == "staging" and ssl_modes == ["disable"]:
+                if not self.staging_postgres_ssl_disable_ack:
+                    raise ValueError("staging PostgreSQL sslmode=disable requires WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=true")
+                if (parsed_postgres_dsn.hostname or "").lower().rstrip(".") != STAGING_POSTGRES_SSL_DISABLE_ALLOWED_HOST:
+                    raise ValueError("staging PostgreSQL sslmode=disable is restricted to the approved internal database host")
+            else:
+                raise ValueError("staging/production PostgreSQL DSN must enable sslmode=verify-full")
         if self.environment in {"staging","production"} and self.s3_endpoint_url and urlparse(self.s3_endpoint_url).scheme!="https":
             raise ValueError("staging/production object storage endpoint must use HTTPS")
         if self.queue_backend=="sqlite" and self.db_path != ":memory:":

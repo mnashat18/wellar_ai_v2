@@ -27,6 +27,31 @@ Create separate EasyPanel staging services before starting V2:
 
 PostgreSQL and object-store persistence belong to the separately managed EasyPanel dependency services. The V2 API/worker containers keep no persistent local media and share no local SQLite state. The application requires PostgreSQL with `sslmode=verify-full` and an HTTPS S3 endpoint in staging; do not weaken those checks to make a local stack start.
 
+### Temporary staging-only PostgreSQL TLS exception
+
+**Temporary workaround only; verified TLS remains required for production.** V2 accepts `sslmode=disable` only when `WELLAR_ENV=staging`, `WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=true`, and the DSN hostname is exactly `continuity_wellar-v2-postgres`. Production continues to require `sslmode=verify-full`, regardless of the acknowledgement flag. This switch does not change S3 HTTPS validation, authentication, or other security checks.
+
+The acknowledgement is an operator assertion, not an automatic network inspection. **Do not set it until the existing EasyPanel PostgreSQL service is proven to share the private V2 network with the V2 API and worker and has no published/public port.** The checked-in Compose file attaches API and worker to an external network but does not manage or prove the network attachment/public exposure of EasyPanel's separately managed PostgreSQL service. That proof is currently an owner action. On the Docker host, inspect the actual containers and network before acknowledging:
+
+```sh
+docker inspect --format '{{json .NetworkSettings.Networks}}' <V2_POSTGRES_CONTAINER>
+docker inspect --format '{{json .NetworkSettings.Networks}}' <V2_API_CONTAINER>
+docker inspect --format '{{json .NetworkSettings.Networks}}' <V2_WORKER_CONTAINER>
+docker port <V2_POSTGRES_CONTAINER>
+```
+
+The three network outputs must show the same isolated V2 network; `docker port` must return no published bindings. Confirm the same facts in EasyPanel if its managed-container names differ. Do not enable the workaround if any output is unavailable, ambiguous, or shows a public binding. Do not change/recreate the PostgreSQL service or its data volume for this workaround.
+
+Only after that evidence is reviewed, set the following in the **V2 staging API and worker** EasyPanel environment. Keep the acknowledgement false until then:
+
+```text
+WELLAR_ENV=staging
+WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=true
+WELLAR_POSTGRES_DSN=postgresql://wellar_v2_user:<URL-ENCODED-EXISTING-PASSWORD>@continuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable&connect_timeout=5
+```
+
+Set the DSN through the protected environment/secret UI; never commit it or print the populated value. Preserve any existing non-TLS query parameters. Redeploy/restart only the V2 API and worker so they read the new settings. Do not restart or modify PostgreSQL, Silo, Directus, Legacy, or their volumes. Check V2 `/ready` and worker heartbeat after restart. This exception is not evidence that the database connection itself is encrypted; it is permitted only on a verified private, unpublished network. Remove the acknowledgement and return the DSN to `sslmode=verify-full` as soon as PostgreSQL TLS is enabled and verified.
+
 ## Environment and secret store
 
 Use `.env.example` as the variable-name template only. Set actual values through EasyPanel protected environment/secrets; do not paste secrets into Git, tickets, reports, command history, or logs.
@@ -35,6 +60,7 @@ Required application values:
 
 - `WELLAR_ENV=staging`, `WELLAR_QUEUE_BACKEND=postgres`, `WELLAR_MEDIA_BACKEND=s3`, `WELLAR_AUTH_MODE=oidc`.
 - `WELLAR_POSTGRES_DSN`: staging DSN with `sslmode=verify-full` and the correct `sslrootcert` path.
+- `WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=false` by default. Temporary exception only: set to `true` with a staging DSN using `sslmode=disable` after verifying the existing PostgreSQL service is attached to the same private V2 network as API/worker and has no published port. The DSN hostname must be exactly `continuity_wellar-v2-postgres`. Never set this in production.
 - `WELLAR_OIDC_ISSUER`, `WELLAR_OIDC_AUDIENCE`, `WELLAR_OIDC_JWKS_URI` (HTTPS), and `WELLAR_OIDC_TENANT_CLAIM`.
 - `WELLAR_S3_BUCKET`, `WELLAR_S3_REGION`, `WELLAR_S3_ENDPOINT_URL` (HTTPS), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; `AWS_CA_BUNDLE` when the private CA is not in the image trust bundle.
 - `WELLAR_POSTGRES_AUTO_MIGRATE=false`; choose bounded pool/queue/retry/decode limits for the staging service and database capacity.
