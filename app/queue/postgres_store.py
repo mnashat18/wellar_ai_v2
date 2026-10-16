@@ -148,6 +148,17 @@ class PostgresQueueStore:
         with self.pool.connection() as conn:
             return conn.execute("SELECT scan_id,directus_scan_id,tenant_id,subject_id,remote_owner_id,remote_tenant_id,remote_scan_status,membership_active,media_owner_verified,verification_version,verified_at FROM directus_scan_bindings WHERE scan_id=%s AND tenant_id=%s AND subject_id=%s",(scan_id,tenant_id,subject_id)).fetchone()
 
+    def set_directus_deletion_state(self,scan_id,state):
+        if state not in {"pending","proven"}:raise ValueError("invalid Directus deletion state")
+        with self.pool.connection() as conn,conn.transaction():
+            row=conn.execute("UPDATE scans SET payload_json=jsonb_set(payload_json,'{_directus_deletion_state}',to_jsonb(%s::text),true),updated_at=now() WHERE scan_id=%s RETURNING scan_id",(state,scan_id)).fetchone()
+            return row is not None
+
+    def list_pending_directus_deletions(self,limit=100):
+        with self.pool.connection() as conn:
+            rows=conn.execute("SELECT scan_id,payload_json->'_directus_pull' AS directus_pull FROM scans WHERE status='failed' AND payload_json->>'_directus_deletion_state'='pending' ORDER BY updated_at LIMIT %s",(max(1,min(int(limit),500)),)).fetchall()
+        return [{"scan_id":row["scan_id"],"directus_pull":row["directus_pull"]} for row in rows if isinstance(row["directus_pull"],dict)]
+
     def claim_directus_outbox(self, publisher_id, *, lease_seconds=30, max_attempts=8, now=None):
         if not publisher_id or not 0<lease_seconds<=600 or not 1<=max_attempts<=12: raise ValueError("publisher limits are invalid")
         instant=datetime.fromtimestamp(now,timezone.utc) if now is not None else datetime.now(timezone.utc)
@@ -193,13 +204,13 @@ class PostgresQueueStore:
             conn.execute("UPDATE outbox SET delivery_status=%s,available_at=%s,lease_until=NULL,publisher_id=NULL,last_error_code=%s WHERE event_id=%s",("dead" if dead else "pending",instant+timedelta(seconds=delay),code,event_id))
             return True
 
-    def fail(self,job,error_code,now=None):
+    def fail(self,job,error_code,now=None,*,force_terminal=False):
         started=time.perf_counter()
         instant=datetime.fromtimestamp(now,timezone.utc) if now is not None else datetime.now(timezone.utc)
         with self.pool.connection() as conn,conn.transaction():
             row=conn.execute("SELECT * FROM jobs WHERE job_id=%s FOR UPDATE",(job["job_id"],)).fetchone()
             if not row or row["status"]!="running" or row["fencing_token"]!=job["fencing_token"] or row["worker_id"]!=job["worker_id"] or row["lease_until"]<instant: raise RuntimeError("stale worker lease")
-            terminal=row["attempts"]>=self.max_attempts
+            terminal=force_terminal or row["attempts"]>=self.max_attempts
             status="failed" if terminal else "queued"
             available=instant+timedelta(seconds=self.retry_base_seconds*(2**max(0,row["attempts"]-1)))
             conn.execute("UPDATE jobs SET status=%s,available_at=%s,lease_until=NULL,worker_id=NULL,last_error=%s WHERE job_id=%s",(status,available,error_code[:80],job["job_id"]))

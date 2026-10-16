@@ -7,7 +7,7 @@ class BoundedMetrics:
     _stages={"accepted","queue_wait","analysis","result_commit","http"}
     _outcomes={"success","retry","failure"}
     _queue={"accepted","claimed","completed","retry_scheduled","terminal_failure"}
-    _storage={"stored","resolve_failed","deleted","retention_deleted","deletion_failed","compensation_failed"}
+    _storage={"stored","resolve_failed","deleted","retention_deleted","deletion_failed","compensation_failed","directus_deletion_failed"}
     def __init__(self): self._lock=Lock(); self._counts=Counter()
     def increment(self, metric: str, label: str) -> None:
         allowed=self._stages if metric=="stage" else self._outcomes if metric=="outcome" else self._queue if metric=="queue" else self._storage if metric=="storage" else set()

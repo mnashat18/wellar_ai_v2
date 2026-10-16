@@ -37,8 +37,10 @@ class Worker:
         media_store=getattr(processor,"media_store",None)
         self.reconciler=MediaReconciler(media_store,store) if media_store is not None and callable(getattr(store,"list_terminal_scan_media_refs",None)) else None
         self._last_reconciliation=0.0
+        self._last_directus_reconciliation=0.0
         if self.reconciler is not None:
             self._reconcile_media()
+        self._reconcile_directus_deletions()
 
     def _reconcile_media(self):
         try:
@@ -47,6 +49,16 @@ class Worker:
         except Exception as exc:
             worker_metrics.increment("storage","reconciliation_failed")
             event(logger,"media.reconciliation.failed",logging.ERROR,processing_stage="media_reconciliation",error_code="reconciliation_failed",exception_type=type(exc).__name__)
+
+    def _reconcile_directus_deletions(self):
+        reconcile=getattr(self.processor,"reconcile_pending_deletions",None)
+        if not callable(reconcile):return
+        try:
+            reconcile()
+            self._last_directus_reconciliation=time.monotonic()
+        except Exception as exc:
+            worker_metrics.increment("storage","directus_deletion_failed")
+            event(logger,"directus.deletion.reconciliation_failed",logging.ERROR,processing_stage="directus_cleanup",error_code="directus_deletion_failed",exception_type=type(exc).__name__)
 
     def _delete_payload_media(self,payload,job):
         media_store=getattr(self.processor,"media_store",None)
@@ -115,14 +127,16 @@ class Worker:
             span.set_attribute("error",True)
             heartbeat_stop.set(); heartbeat_thread.join(timeout=heartbeat_interval+0.1)
             self._delete_payload_media(payload,job)
+            retryable=getattr(exc,"retryable",True) and job["attempts"] < self.store.max_attempts
+            safe_failure_codes={"stale worker lease":"lease_lost","scan media deletion failed":"media_delete_failed"}
+            failure_code=getattr(exc,"error_code",None)
+            if not isinstance(failure_code,str) or not re.fullmatch(r"[a-z0-9_.-]{1,80}",failure_code):
+                failure_code=safe_failure_codes.get(str(exc),"processing_error")
             try:
-                self.store.fail(job,"processing_error")
+                self.store.fail(job,failure_code,force_terminal=not retryable)
             except RuntimeError:
                 event(logger,"scan.processing.lease_lost",logging.WARNING,scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,processing_stage="lease",error_code="lease_lost")
                 return True
-            retryable=job["attempts"] < self.store.max_attempts
-            safe_failure_codes={"stale worker lease":"lease_lost","scan media deletion failed":"media_delete_failed"}
-            failure_code=safe_failure_codes.get(str(exc),"processing_error")
             worker_metrics.increment("outcome","retry" if retryable else "failure")
             event(logger,"scan.processing.retry_scheduled" if retryable else "scan.processing.failed",logging.WARNING if retryable else logging.ERROR,scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,processing_stage="analysis",error_code=failure_code,exception_type=type(exc).__name__,attempt=job["attempts"])
         finally:
@@ -136,4 +150,6 @@ class Worker:
         while not stop_event.is_set():
             if self.reconciler is not None and time.monotonic()-self._last_reconciliation>=300:
                 self._reconcile_media()
+            if time.monotonic()-self._last_directus_reconciliation>=300:
+                self._reconcile_directus_deletions()
             if not self.run_once(): stop_event.wait(idle_seconds)

@@ -345,6 +345,28 @@ class SQLiteQueueStore:
         row=self.db.execute("SELECT scan_id,directus_scan_id,tenant_id,subject_id,remote_owner_id,remote_tenant_id,remote_scan_status,membership_active,media_owner_verified,verification_version,verified_at FROM directus_scan_bindings WHERE scan_id=? AND tenant_id=? AND subject_id=?",(scan_id,tenant_id,subject_id)).fetchone()
         return dict(row) if row else None
 
+    @_db_operation("set_directus_deletion_state")
+    def set_directus_deletion_state(self, scan_id: str, state: str) -> bool:
+        if state not in {"pending","proven"}:raise ValueError("invalid Directus deletion state")
+        row=self.db.execute("SELECT payload_json FROM scans WHERE scan_id=?",(scan_id,)).fetchone()
+        if not row:return False
+        payload=json.loads(row["payload_json"])
+        if not isinstance(payload,dict):return False
+        payload["_directus_deletion_state"]=state
+        cursor=self.db.execute("UPDATE scans SET payload_json=?,updated_at=? WHERE scan_id=?",(json.dumps(payload,sort_keys=True,separators=(",",":")),time.time(),scan_id))
+        return cursor.rowcount==1
+
+    @_db_operation("list_pending_directus_deletions")
+    def list_pending_directus_deletions(self, limit: int=100):
+        rows=self.db.execute("SELECT scan_id,payload_json FROM scans WHERE status='failed' ORDER BY updated_at LIMIT ?",(max(1,min(int(limit),500)),)).fetchall()
+        pending=[]
+        for row in rows:
+            try:payload=json.loads(row["payload_json"])
+            except (TypeError,ValueError):continue
+            if isinstance(payload,dict) and payload.get("_directus_deletion_state")=="pending" and isinstance(payload.get("_directus_pull"),dict):
+                pending.append({"scan_id":row["scan_id"],"directus_pull":payload["_directus_pull"]})
+        return pending
+
     @_db_operation("claim_directus_outbox", transaction=True)
     def claim_directus_outbox(self, publisher_id: str, *, lease_seconds: float=30, max_attempts: int=8, now: float | None=None):
         if not publisher_id or not 0<lease_seconds<=600 or not 1<=max_attempts<=12: raise ValueError("publisher limits are invalid")
@@ -431,7 +453,7 @@ class SQLiteQueueStore:
             return cursor.rowcount==1
 
     @_db_operation("fail", transaction=True)
-    def fail(self, job: dict, error_code: str, now: float | None = None):
+    def fail(self, job: dict, error_code: str, now: float | None = None, *, force_terminal: bool=False):
         now=now or time.time()
         with self._lock:
             self.db.execute("BEGIN IMMEDIATE")
@@ -439,7 +461,7 @@ class SQLiteQueueStore:
                 row=self.db.execute("SELECT * FROM jobs WHERE job_id=?",(job["job_id"],)).fetchone()
                 if not row or row["status"]!="running" or row["fencing_token"]!=job["fencing_token"] or row["worker_id"]!=job["worker_id"] or row["lease_until"] < now:
                     raise RuntimeError("stale worker lease")
-                if row["attempts"]>=self.max_attempts:
+                if force_terminal or row["attempts"]>=self.max_attempts:
                     status="failed"; available=now
                 else:
                     status="queued"; available=now+self.retry_base_seconds*(2**(row["attempts"]-1))

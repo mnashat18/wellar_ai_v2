@@ -2,11 +2,13 @@ import time
 from uuid import UUID
 import hashlib
 import json
+import logging
 
 import httpx
 import pytest
 
-from app.compat.directus_facade import DirectusHTTPClient, DirectusProcessRequest, DirectusPullProcessor, DirectusUnavailable
+from app.compat.directus_facade import DirectusHTTPClient, DirectusPermanentFailure, DirectusProcessRequest, DirectusPullProcessor, DirectusUnavailable
+from app.core.logging import JsonFormatter
 from app.security.auth import Principal
 from tests.media_fixtures import image_bytes, wav_bytes
 from app.workers.worker import Worker
@@ -97,9 +99,10 @@ def test_pull_rejects_wrong_owner_or_unattached_file_before_fetch(client,failure
     if failure=="wrong_tenant": fake.scans["business_profile"]="tenant-b"
     else: fake.relations["video_file"]="99999999-9999-4999-8999-999999999999"
     processor=DirectusPullProcessor(fake,client.app.state.media_store,lambda payload: pytest.fail("should reject before analysis"))
-    with pytest.raises(ValueError):
+    with pytest.raises(DirectusPermanentFailure):
         processor({"_directus_pull":request_payload(),"_worker_context":{"tenant_id":"tenant-a","subject_id":USER}})
-    assert fake.deleted==[]
+    assert set(fake.deleted)=={VIDEO,AUDIO,IMAGE}
+    assert fake.statuses==["failed"]
 
 
 def test_delete_failure_retries_then_retry_uses_idempotent_result(client):
@@ -151,12 +154,14 @@ def test_directus_down_releases_lease_and_worker_retry_completes(client,store):
 def test_file_size_mime_and_corrupt_content_are_rejected(client):
     fake=FakeDirectus(); fake.blobs[IMAGE]=(b"x"*(5*1024*1024+1),"image/jpeg")
     processor=DirectusPullProcessor(fake,client.app.state.media_store,lambda payload: {})
-    with pytest.raises(ValueError,match="too_large"):
+    with pytest.raises(DirectusPermanentFailure,match="invalid_media"):
         processor({"_directus_pull":request_payload(),"_worker_context":{"tenant_id":"tenant-a","subject_id":USER}})
+    assert set(fake.deleted)=={VIDEO,AUDIO,IMAGE}
     fake=FakeDirectus(); fake.blobs[IMAGE]=(b"not-jpeg","image/jpeg")
     processor=DirectusPullProcessor(fake,client.app.state.media_store,lambda payload: {})
-    with pytest.raises(Exception):
+    with pytest.raises(DirectusPermanentFailure,match="invalid_media"):
         processor({"_directus_pull":request_payload(),"_worker_context":{"tenant_id":"tenant-a","subject_id":USER}})
+    assert set(fake.deleted)=={VIDEO,AUDIO,IMAGE}
 
 
 def test_http_client_rejects_redirect_private_origin_and_oversize_file():
@@ -212,7 +217,111 @@ def test_http_mock_server_happy_path_uses_only_ids_and_idempotent_result_write(c
     assert remote["status_writes"]==["completed"]
     assert remote["results"][0]["risk_level"]=="Elevated Fatigue"
     assert remote["results"][0]["confidence"] is None
-    projection=remote["results"][0]["internal_analysis"]["projection"]
+    stored_analysis=remote["results"][0]["internal_analysis"]
+    assert isinstance(stored_analysis,str)
+    decoded_analysis=json.loads(stored_analysis)
+    assert stored_analysis==json.dumps(decoded_analysis,sort_keys=True,separators=(",",":"))
+    projection=decoded_analysis["projection"]
     assert all(projection[field] is None for field in ("readiness_score","fatigue_score","focus_score","risk_score","confidence_score"))
-    assert remote["results"][0]["internal_analysis"]["deletion_proven"] is True
+    assert decoded_analysis["deletion_proven"] is True
+    assert isinstance(remote["results"][0]["explanation"],str) and remote["results"][0]["explanation"].strip()
     assert len(calls)==1
+
+
+def _failure_worker(client,handler):
+    store=client.app.state.store
+    principal=Principal(subject_id=USER,tenant_id="tenant-a")
+    payload={"_directus_pull":request_payload(),"media_refs":[]}
+    raw=json.dumps(payload,sort_keys=True,separators=(",",":"))
+    store.submit(SCAN,principal,SCAN,hashlib.sha256(raw.encode()).hexdigest(),raw,"directus-failure-test")
+    directus=DirectusHTTPClient("https://directus.test","local-fake-token",transport=httpx.MockTransport(handler))
+    processor=DirectusPullProcessor(directus,client.app.state.media_store,lambda _payload:{"status":"insufficient_evidence","drowsiness_indicator":{"status":"insufficient_quality"}})
+    return Worker(store,"directus-failure-test",processor),processor,store
+
+
+def _error_remote(mode):
+    remote={"deleted":set(),"statuses":[],"delete_fail":False}
+    files={VIDEO:(b"0000ftypisomsynthetic","video/mp4"),AUDIO:(wav_bytes(seconds=.1),"audio/wav"),IMAGE:(image_bytes(),"image/jpeg")}
+    def handler(request):
+        path=request.url.path
+        if request.method=="GET" and path=="/items/scan_results":return httpx.Response(200,json={"data":[]})
+        if request.method=="GET" and path==f"/items/wellness_scans/{SCAN}":
+            if mode=="lookup_403":return httpx.Response(403,json={"errors":[{"extensions":{"code":"FORBIDDEN","field":"user","value":"private-owner-value"}}]})
+            if mode=="lookup_503":return httpx.Response(503,json={"errors":[{"extensions":{"code":"TEMPORARY"}}]})
+            return httpx.Response(200,json={"data":{"id":SCAN,"user":USER,"business_profile":"tenant-a","status":"media_ready"}})
+        if request.method=="GET" and path=="/items/scan_media":
+            return httpx.Response(200,json={"data":[{"scan_id":SCAN,"video_file":VIDEO,"audio_file":AUDIO,"image_file":IMAGE}]})
+        if request.method=="GET" and path.startswith("/assets/"):
+            data,mime=files[path.rsplit("/",1)[-1]]
+            return httpx.Response(200,headers={"content-type":mime,"content-length":str(len(data))},content=data)
+        if request.method=="POST" and path=="/items/scan_results":
+            return httpx.Response(400,json={"errors":[{"extensions":{"code":"INVALID_PAYLOAD","field":"internal_analysis","value":"private-body-value"}}]})
+        if request.method=="PATCH" and path==f"/items/wellness_scans/{SCAN}":
+            remote["statuses"].append(json.loads(request.content)["status"])
+            return httpx.Response(200,json={"data":{"id":SCAN}})
+        if request.method=="DELETE" and path.startswith("/files/"):
+            file_id=path.rsplit("/",1)[-1]
+            if remote["delete_fail"]:return httpx.Response(503,json={"errors":[{"extensions":{"code":"TEMPORARY"}}]})
+            remote["deleted"].add(file_id)
+            return httpx.Response(204)
+        return httpx.Response(404,json={"errors":[{"extensions":{"code":"NOT_FOUND"}}]})
+    return handler,remote
+
+
+def test_directus_400_result_write_fails_v2_and_deletes_remote_files(client):
+    handler,remote=_error_remote("write_400")
+    worker,processor,store=_failure_worker(client,handler)
+    assert worker.run_once() is True
+    assert store.get_scan(SCAN,"tenant-a",USER)["status"]=="failed"
+    assert remote["statuses"]==["failed"]
+    assert remote["deleted"]=={VIDEO,AUDIO,IMAGE}
+    payload=json.loads(store.db.execute("SELECT payload_json FROM scans WHERE scan_id=?",(SCAN,)).fetchone()[0])
+    assert payload["_directus_deletion_state"]=="proven"
+
+
+def test_directus_403_scan_lookup_fails_v2_and_deletes_remote_files(client):
+    handler,remote=_error_remote("lookup_403")
+    worker,_,store=_failure_worker(client,handler)
+    assert worker.run_once() is True
+    assert store.get_scan(SCAN,"tenant-a",USER)["status"]=="failed"
+    assert remote["statuses"]==["failed"]
+    assert remote["deleted"]=={VIDEO,AUDIO,IMAGE}
+
+
+def test_directus_503_scan_lookup_retries_and_keeps_remote_files(client):
+    handler,remote=_error_remote("lookup_503")
+    worker,_,store=_failure_worker(client,handler)
+    assert worker.run_once() is True
+    assert store.get_scan(SCAN,"tenant-a",USER)["status"]=="queued"
+    assert remote["statuses"]==[] and remote["deleted"]==set()
+
+
+def test_permanent_failure_deletion_state_is_persisted_and_reconciled(client):
+    handler,remote=_error_remote("lookup_403")
+    worker,processor,store=_failure_worker(client,handler)
+    remote["delete_fail"]=True
+    assert worker.run_once() is True
+    assert store.get_scan(SCAN,"tenant-a",USER)["status"]=="failed"
+    payload=json.loads(store.db.execute("SELECT payload_json FROM scans WHERE scan_id=?",(SCAN,)).fetchone()[0])
+    assert payload["_directus_deletion_state"]=="pending"
+    remote["delete_fail"]=False
+    assert processor.reconcile_pending_deletions()==1
+    payload=json.loads(store.db.execute("SELECT payload_json FROM scans WHERE scan_id=?",(SCAN,)).fetchone()[0])
+    assert payload["_directus_deletion_state"]=="proven"
+    assert remote["deleted"]=={VIDEO,AUDIO,IMAGE}
+
+
+def test_directus_error_logs_status_code_and_fields_without_values_or_token(caplog):
+    response_body={"errors":[{"message":"validation failed","extensions":{"code":"INVALID_PAYLOAD","field":"scan.status","value":"private-value-canary","authorization":"Bearer private-token-canary"}}]}
+    directus=DirectusHTTPClient("https://directus.test","local-private-token-canary",transport=httpx.MockTransport(lambda _request:httpx.Response(422,json=response_body)))
+    with caplog.at_level(logging.WARNING,logger="wellar.directus"),pytest.raises(DirectusPermanentFailure):
+        directus.get_scan(SCAN)
+    record=next(record for record in caplog.records if record.getMessage()=="directus.http.error")
+    rendered=JsonFormatter().format(record)
+    assert '"status_code":422' in rendered
+    assert '"endpoint_name":"items.wellness_scans"' in rendered
+    assert '"error_code":"directus_validation_error"' in rendered
+    assert '"directus_error_code":"INVALID_PAYLOAD"' in rendered
+    assert '"field_names":"scan.status"' in rendered
+    assert "private-value-canary" not in rendered
+    assert "private-token-canary" not in rendered
