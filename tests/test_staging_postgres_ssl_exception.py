@@ -27,7 +27,7 @@ def _staging_settings(
 
 def test_staging_ssl_disable_is_allowed_only_for_exact_internal_host_with_ack():
     settings = _staging_settings(
-        "postgresql://wellar_v2_user:placeholder@continuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable",
+        "postgresql://wellar_v2_user:placeholder@conntinuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable",
         ack=True,
     )
 
@@ -36,7 +36,7 @@ def test_staging_ssl_disable_is_allowed_only_for_exact_internal_host_with_ack():
 
 def test_staging_ssl_disable_without_ack_is_rejected():
     settings = _staging_settings(
-        "postgresql://wellar_v2_user:placeholder@continuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable"
+        "postgresql://wellar_v2_user:placeholder@conntinuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable"
     )
 
     with pytest.raises(ValueError, match="WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=true"):
@@ -55,7 +55,7 @@ def test_staging_ssl_disable_for_unknown_host_is_rejected_even_with_ack():
 
 def test_production_ssl_disable_is_rejected_even_with_staging_ack():
     settings = _staging_settings(
-        "postgresql://wellar_v2_user:placeholder@continuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable",
+        "postgresql://wellar_v2_user:placeholder@conntinuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable",
         ack=True,
         environment="production",
     )
@@ -66,7 +66,7 @@ def test_production_ssl_disable_is_rejected_even_with_staging_ack():
 
 def test_staging_exception_does_not_weaken_s3_https_requirement():
     settings = _staging_settings(
-        "postgresql://wellar_v2_user:placeholder@continuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable",
+        "postgresql://wellar_v2_user:placeholder@conntinuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable",
         ack=True,
         s3_endpoint_url="http://s3.staging.invalid",
     )

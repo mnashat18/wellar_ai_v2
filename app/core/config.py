@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-STAGING_POSTGRES_SSL_DISABLE_ALLOWED_HOST = "continuity_wellar-v2-postgres"
+STAGING_POSTGRES_SSL_DISABLE_ALLOWED_HOST = "conntinuity_wellar-v2-postgres"
 
 
 def _env_bool(name:str,default:bool)->bool:

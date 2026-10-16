@@ -29,7 +29,7 @@ PostgreSQL and object-store persistence belong to the separately managed EasyPan
 
 ### Temporary staging-only PostgreSQL TLS exception
 
-**Temporary workaround only; verified TLS remains required for production.** V2 accepts `sslmode=disable` only when `WELLAR_ENV=staging`, `WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=true`, and the DSN hostname is exactly `continuity_wellar-v2-postgres`. Production continues to require `sslmode=verify-full`, regardless of the acknowledgement flag. This switch does not change S3 HTTPS validation, authentication, or other security checks.
+**Temporary workaround only; verified TLS remains required for production.** V2 accepts `sslmode=disable` only when `WELLAR_ENV=staging`, `WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=true`, and the DSN hostname is exactly `conntinuity_wellar-v2-postgres`. Production continues to require `sslmode=verify-full`, regardless of the acknowledgement flag. This switch does not change S3 HTTPS validation, authentication, or other security checks.
 
 The acknowledgement is an operator assertion, not an automatic network inspection. **Do not set it until the existing EasyPanel PostgreSQL service is proven to share the private V2 network with the V2 API and worker and has no published/public port.** The checked-in Compose file attaches API and worker to an external network but does not manage or prove the network attachment/public exposure of EasyPanel's separately managed PostgreSQL service. That proof is currently an owner action. On the Docker host, inspect the actual containers and network before acknowledging:
 
@@ -47,7 +47,7 @@ Only after that evidence is reviewed, set the following in the **V2 staging API 
 ```text
 WELLAR_ENV=staging
 WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=true
-WELLAR_POSTGRES_DSN=postgresql://wellar_v2_user:<URL-ENCODED-EXISTING-PASSWORD>@continuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable&connect_timeout=5
+WELLAR_POSTGRES_DSN=postgresql://wellar_v2_user:<URL-ENCODED-EXISTING-PASSWORD>@conntinuity_wellar-v2-postgres:5432/wellar_v2?sslmode=disable&connect_timeout=5
 ```
 
 Set the DSN through the protected environment/secret UI; never commit it or print the populated value. Preserve any existing non-TLS query parameters. Redeploy/restart only the V2 API and worker so they read the new settings. Do not restart or modify PostgreSQL, Silo, Directus, Legacy, or their volumes. Check V2 `/ready` and worker heartbeat after restart. This exception is not evidence that the database connection itself is encrypted; it is permitted only on a verified private, unpublished network. Remove the acknowledgement and return the DSN to `sslmode=verify-full` as soon as PostgreSQL TLS is enabled and verified.
@@ -60,7 +60,7 @@ Required application values:
 
 - `WELLAR_ENV=staging`, `WELLAR_QUEUE_BACKEND=postgres`, `WELLAR_MEDIA_BACKEND=s3`, `WELLAR_AUTH_MODE=oidc`.
 - `WELLAR_POSTGRES_DSN`: staging DSN with `sslmode=verify-full` and the correct `sslrootcert` path.
-- `WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=false` by default. Temporary exception only: set to `true` with a staging DSN using `sslmode=disable` after verifying the existing PostgreSQL service is attached to the same private V2 network as API/worker and has no published port. The DSN hostname must be exactly `continuity_wellar-v2-postgres`. Never set this in production.
+- `WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK=false` by default. Temporary exception only: set to `true` with a staging DSN using `sslmode=disable` after verifying the existing PostgreSQL service is attached to the same private V2 network as API/worker and has no published port. The DSN hostname must be exactly `conntinuity_wellar-v2-postgres`. Never set this in production.
 - `WELLAR_OIDC_ISSUER`, `WELLAR_OIDC_AUDIENCE`, `WELLAR_OIDC_JWKS_URI` (HTTPS), and `WELLAR_OIDC_TENANT_CLAIM`.
 - `WELLAR_S3_BUCKET`, `WELLAR_S3_REGION`, `WELLAR_S3_ENDPOINT_URL` (HTTPS), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; `AWS_CA_BUNDLE` when the private CA is not in the image trust bundle.
 - `WELLAR_POSTGRES_AUTO_MIGRATE=false`; choose bounded pool/queue/retry/decode limits for the staging service and database capacity.
