@@ -12,8 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WELLAR_POSTGRES_AUTO_MIGRATE=false \
     WELLAR_MODEL_INFERENCE_ENABLED=false \
     WELLAR_RESEARCH_IMAGE_DROWSINESS_ENABLED=false \
-    HOME=/home/wellar \
-    TMPDIR=/tmp/wellar
+    HOME=/home/wellar
 
 WORKDIR /srv/wellar
 
@@ -27,6 +26,10 @@ RUN apt-get update \
     && useradd --system --gid wellar --create-home wellar \
     && mkdir -p /var/lib/wellar /tmp/wellar /home/wellar/.cache \
     && chown -R wellar:wellar /var/lib/wellar /tmp/wellar /home/wellar
+
+# Keep apt package installation on the base image's writable /tmp. Set the
+# worker runtime temp directory only after it exists and is owned by wellar.
+ENV TMPDIR=/tmp/wellar
 
 COPY requirements-lock.txt requirements-runtime.txt ./
 RUN python -m pip install --no-cache-dir --disable-pip-version-check \
