@@ -1,0 +1,45 @@
+FROM python:3.11.13-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    WELLAR_ENV=production \
+    WELLAR_QUEUE_BACKEND=postgres \
+    WELLAR_MEDIA_BACKEND=s3 \
+    WELLAR_MEDIA_ROOT=/tmp/wellar \
+    WELLAR_AUTH_MODE=oidc \
+    WELLAR_POSTGRES_AUTO_MIGRATE=false \
+    WELLAR_MODEL_INFERENCE_ENABLED=false \
+    WELLAR_RESEARCH_IMAGE_DROWSINESS_ENABLED=false \
+    HOME=/home/wellar \
+    TMPDIR=/tmp/wellar
+
+WORKDIR /srv/wellar
+
+# Match the API image's native runtime libraries and pinned Python dependencies.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates libgl1 libglib2.0-0 libstdc++6 libgomp1 \
+       libsm6 libxext6 libxrender1 libportaudio2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system wellar \
+    && useradd --system --gid wellar --create-home wellar \
+    && mkdir -p /var/lib/wellar /tmp/wellar /home/wellar/.cache \
+    && chown -R wellar:wellar /var/lib/wellar /tmp/wellar /home/wellar
+
+COPY requirements-lock.txt requirements-runtime.txt ./
+RUN python -m pip install --no-cache-dir --disable-pip-version-check \
+       --constraint requirements-lock.txt --requirement requirements-runtime.txt \
+    && python -m pip check
+
+COPY --chown=wellar:wellar app ./app
+COPY --chown=wellar:wellar config ./config
+COPY --chown=wellar:wellar deployment/migrations ./deployment/migrations
+
+USER wellar:wellar
+STOPSIGNAL SIGTERM
+
+# No HTTP port or API-only health check. The entrypoint handles SIGTERM and
+# closes the worker, media store, and PostgreSQL pool during shutdown.
+CMD ["python", "-m", "app.workers.entrypoint"]
