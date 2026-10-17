@@ -151,6 +151,34 @@ def test_directus_down_releases_lease_and_worker_retry_completes(client,store):
     assert set(fake.deleted)=={VIDEO,AUDIO,IMAGE}
 
 
+def test_directus_transient_analysis_failure_deletes_staged_copy_but_keeps_remote_files(client,store):
+    fake=FakeDirectus(); observed_refs=[]; calls=[]
+    def analyze(payload):
+        calls.append(1)
+        observed_refs.extend(payload["media_refs"])
+        if len(calls)==1:
+            raise DirectusUnavailable("directus_unavailable")
+        return {"status":"insufficient_evidence","drowsiness_indicator":{"status":"insufficient_quality","config_version":"1.0"}}
+    processor=DirectusPullProcessor(fake,client.app.state.media_store,analyze)
+    principal=Principal(subject_id=USER,tenant_id="tenant-a")
+    payload={"media_refs":[],"_directus_pull":request_payload()}
+    raw=json.dumps(payload,sort_keys=True,separators=(",",":"))
+    internal_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    store.submit(internal_id,principal,SCAN,hashlib.sha256(raw.encode()).hexdigest(),raw,"directus-staged-retry")
+    worker=Worker(store,"directus-staged-retry-worker",processor)
+
+    assert worker.run_once()
+    assert store.get_scan(internal_id,"tenant-a",USER)["status"]=="queued"
+    assert observed_refs
+    assert all(client.app.state.media_store.resolve(ref,"tenant-a",USER) is None for ref in observed_refs)
+    assert fake.deleted==[]
+
+    time.sleep(.02)
+    assert worker.run_once()
+    assert store.get_scan(internal_id,"tenant-a",USER)["status"]=="completed"
+    assert set(fake.deleted)=={VIDEO,AUDIO,IMAGE}
+
+
 def test_file_size_mime_and_corrupt_content_are_rejected(client):
     fake=FakeDirectus(); fake.blobs[IMAGE]=(b"x"*(5*1024*1024+1),"image/jpeg")
     processor=DirectusPullProcessor(fake,client.app.state.media_store,lambda payload: {})

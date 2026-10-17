@@ -107,16 +107,18 @@ def test_retention_preserves_media_through_retries_then_releases_terminal_failur
     })
     assert accepted.status_code==202
     def failing_processor(_payload):raise RuntimeError("synthetic processor failure")
+    failing_processor.media_store=client.app.state.media_store
     worker=Worker(client.app.state.store,"retention-failure-worker",failing_processor)
     assert client.app.state.media_store.purge_expired(1)==0
     assert worker.run_once()
     assert client.app.state.store.get_scan(accepted.json()["scan_id"],"tenant-a","user-a")["status"]=="queued"
     assert client.app.state.media_store.purge_expired(1)==0
+    assert client.app.state.media_store.resolve(ref,"tenant-a","user-a") is not None
     time.sleep(.01)
     assert worker.run_once()
     assert client.app.state.store.get_scan(accepted.json()["scan_id"],"tenant-a","user-a")["status"]=="failed"
-    assert client.app.state.media_store.purge_expired(1)==1
     assert client.app.state.media_store.resolve(ref,"tenant-a","user-a") is None
+    assert client.app.state.media_store.purge_expired(1)==0
 
 
 def test_media_scan_requires_explicit_consent_and_records_owned_reference(client,auth):

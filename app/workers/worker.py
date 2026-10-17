@@ -126,8 +126,13 @@ class Worker:
         except Exception as exc:
             span.set_attribute("error",True)
             heartbeat_stop.set(); heartbeat_thread.join(timeout=heartbeat_interval+0.1)
-            self._delete_payload_media(payload,job)
-            retryable=getattr(exc,"retryable",True) and job["attempts"] < self.store.max_attempts
+            retryable=(getattr(exc,"retryable",True) and not isinstance(exc,ValueError)
+                       and job["attempts"] < self.store.max_attempts)
+            # Native jobs need their uploaded media for a retry. Directus jobs
+            # refetch remote files on every attempt, and the facade also cleans
+            # any staged V2 copies in its own finally block.
+            if payload.get("_directus_pull") or not retryable:
+                self._delete_payload_media(payload,job)
             safe_failure_codes={"stale worker lease":"lease_lost","scan media deletion failed":"media_delete_failed"}
             failure_code=getattr(exc,"error_code",None)
             if not isinstance(failure_code,str) or not re.fullmatch(r"[a-z0-9_.-]{1,80}",failure_code):
