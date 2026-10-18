@@ -88,7 +88,7 @@ class S3ObjectMediaStore:
                 if not _signature_ok(modality,normalized,bytes(head)): raise MediaInputError("invalid_media_signature","Media bytes do not match the declared content type")
                 hexdigest=digest.hexdigest()
                 try:
-                    self.client.upload_file(path,self.bucket,key,ExtraArgs={"ContentType":normalized,"Metadata":{"sha256":hexdigest,"tenant_ref":hashlib.sha256(tenant_id.encode()).hexdigest()[:16]},"ServerSideEncryption":"AES256"})
+                    self.client.upload_file(path,self.bucket,key,ExtraArgs={"ContentType":normalized,"Metadata":{"sha256":hexdigest,"tenant_ref":hashlib.sha256(tenant_id.encode()).hexdigest()[:16]}})
                 except Exception as exc:
                     event(logger,"media.object.upload_failed",logging.ERROR,processing_stage="object_upload",modality=modality,error_code="object_storage_unavailable",exception_type=type(exc).__name__)
                     raise WellarError("object_storage_unavailable","Object storage is temporarily unavailable",503,True) from None
