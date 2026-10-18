@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -11,6 +13,7 @@ from app.security.auth import (
     AuthenticationProviderUnavailable,
     DirectusAuthenticator,
     Principal,
+    TenantAuthorizationDenied,
 )
 
 
@@ -57,11 +60,18 @@ def test_directus_authenticates_opaque_session_and_checks_membership_each_reques
     auth = DirectusAuthenticator("https://directus.example", opener=opener)
     assert auth.authenticate("opaque-session-token") == Principal("employee-1", "company-1")
     # Membership removal is observed on the next call: no cached authorization.
-    assert auth.authenticate("opaque-session-token") is None
+    with pytest.raises(TenantAuthorizationDenied):
+        auth.authenticate("opaque-session-token")
     assert len(opener.requests) == 4
     assert all(req.get_header("Authorization") == "Bearer opaque-session-token" for req, _ in opener.requests)
     assert all(timeout == 3.0 for _, timeout in opener.requests)
-    assert "company-1" in opener.requests[1][0].full_url
+    membership_url=urlparse(opener.requests[1][0].full_url)
+    assert membership_url.path=="/items/business_profile_members"
+    query=parse_qs(membership_url.query)
+    assert query["fields"]==["id,user,business_profile,status"]
+    assert query["filter[user][_eq]"]==["employee-1"]
+    assert query["filter[business_profile][_eq]"]==["company-1"]
+    assert query["filter[status][_eq]"]==["active"]
 
 
 def test_directus_rejects_inactive_user_mismatched_or_ambiguous_membership():
@@ -70,9 +80,12 @@ def test_directus_rejects_inactive_user_mismatched_or_ambiguous_membership():
         user(), membership(subject="another-user"),
         user(), {"data": [{}, {}]},
     ]))
-    assert auth.authenticate("opaque") is None
-    assert auth.authenticate("opaque") is None
-    assert auth.authenticate("opaque") is None
+    with pytest.raises(TenantAuthorizationDenied):
+        auth.authenticate("opaque")
+    with pytest.raises(TenantAuthorizationDenied):
+        auth.authenticate("opaque")
+    with pytest.raises(TenantAuthorizationDenied):
+        auth.authenticate("opaque")
 
 
 def test_expired_or_revoked_directus_session_fails_closed():
@@ -87,7 +100,62 @@ def test_changed_directus_permission_denies_membership_lookup():
         user(),
         HTTPError("https://directus.example/items/business_profile_members", 403, "forbidden", {}, None),
     ]))
-    assert auth.authenticate("opaque") is None
+    try:
+        auth.authenticate("opaque")
+    except TenantAuthorizationDenied:
+        pass
+    else:
+        raise AssertionError("membership permission denial must remain a tenant authorization error")
+
+
+def test_auth_diagnostics_report_stages_without_sensitive_values(caplog):
+    caplog.set_level("INFO")
+    secret_values = ("opaque-secret-token", "employee-private", "tenant-private", "private@example.test")
+    auth = DirectusAuthenticator("https://directus.example", opener=FakeOpener([
+        user(subject=secret_values[1], tenant=secret_values[2]),
+        membership(subject=secret_values[1], tenant=secret_values[2]),
+    ]))
+    assert auth.authenticate(secret_values[0]) == Principal(secret_values[1], secret_values[2])
+    text = " ".join(record.getMessage() + str(getattr(record, "event_fields", {})) for record in caplog.records)
+    assert "auth.directus_users_me_request" in text
+    assert "auth.directus_users_me_status" in text
+    assert "auth.user_status_validation" in text
+    assert "auth.active_business_profile_validation" in text
+    assert "auth.membership_query_status" in text
+    assert "auth.membership_validation" in text
+    assert all(value not in text for value in secret_values)
+
+
+def test_directus_rejection_stages_are_distinguished_in_safe_logs(caplog):
+    caplog.set_level("INFO")
+    cases = [
+        ([HTTPError("https://directus.example/users/me", 401, "unauthorized", {}, None)], "auth.directus_users_me_status"),
+        ([{"data": {"id": "employee-1", "status": "suspended", "active_business_profile": "company-1"}}], "auth.user_status_validation"),
+        ([{"data": {"id": "employee-1", "status": "active", "active_business_profile": None}}], "auth.active_business_profile_validation"),
+        ([user(), membership(status="inactive")], "auth.membership_validation"),
+        ([user(), membership(tenant="another-company")], "auth.membership_validation"),
+    ]
+    for responses, expected_event in cases:
+        caplog.clear()
+        try:
+            DirectusAuthenticator("https://directus.example", opener=FakeOpener(responses)).authenticate("safe-test-token")
+        except TenantAuthorizationDenied:
+            pass
+        assert any(expected_event in record.getMessage() for record in caplog.records)
+        assert "safe-test-token" not in caplog.text
+
+
+def test_membership_permission_failure_maps_to_http_403():
+    settings = Settings(environment="test", db_path=":memory:", auth_mode="directus",
+                        directus_url="https://directus.example")
+    client = TestClient(create_app(settings=settings, authenticator=DirectusAuthenticator(
+        "https://directus.example", opener=FakeOpener([
+            user(), HTTPError("https://directus.example/items/business_profile_members", 403, "forbidden", {}, None)
+        ]))))
+    response = client.get("/api/v1/scans/any", headers={"Authorization": "Bearer opaque"})
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "tenant_access_denied"
+    assert "opaque" not in response.text
 
 
 def test_directus_outage_is_distinguished_without_provider_details():
@@ -118,7 +186,8 @@ def test_directus_invalid_payload_and_oversized_token_fail_closed():
     auth = DirectusAuthenticator("https://directus.example", opener=FakeOpener([
         {"unexpected": "shape"}
     ]))
-    assert auth.authenticate("opaque") is None
+    with pytest.raises(AuthenticationProviderUnavailable):
+        auth.authenticate("opaque")
     assert auth.authenticate("x" * 16_385) is None
     assert auth.authenticate("bad\r\nheader") is None
 
@@ -151,3 +220,41 @@ def test_directus_outage_returns_redacted_retryable_service_error():
     assert response.json()["error"]["retryable"] is True
     assert "do-not-leak" not in response.text
     assert "opaque" not in response.text
+
+
+@pytest.mark.parametrize("responses,expected_status", [
+    ([user(), membership()], 404),
+    ([HTTPError("https://directus.example/users/me", 401, "unauthorized", {}, None)], 401),
+    ([{"data": {"id": "employee-1", "status": "suspended", "active_business_profile": "company-1"}}], 403),
+    ([{"data": {"id": "employee-1", "active_business_profile": "company-1"}}], 503),
+    ([{"data": {"id": "employee-1", "status": "active"}}], 503),
+    ([{"data": {"id": "employee-1", "status": "active", "active_business_profile": None}}], 403),
+    ([user(), membership(tenant="another-company")], 403),
+    ([user(), membership(status="inactive")], 403),
+    ([user(), HTTPError("https://directus.example/items/business_profile_members", 403, "forbidden", {}, None)], 403),
+    ([user(), {"data": [{"id": "membership-1", "status": "active"}]}], 503),
+    ([HTTPError("https://directus.example/users/me", 403, "forbidden", {}, None)], 503),
+    ([URLError("provider unavailable")], 503),
+])
+def test_directus_auth_status_mapping_and_safe_request_events(responses,expected_status,capsys):
+    token="synthetic-auth-token"
+    settings=Settings(environment="test",db_path=":memory:",auth_mode="directus",
+                       directus_url="https://directus.example")
+    app=create_app(settings=settings,authenticator=DirectusAuthenticator(
+        "https://directus.example",opener=FakeOpener(responses)))
+    with TestClient(app) as client:
+        response=client.get("/api/v1/scans/not-present",headers={"Authorization":f"Bearer {token}"})
+    log_text=capsys.readouterr().err
+    assert response.status_code==expected_status
+    assert token not in log_text and token not in response.text
+    assert "auth.token_present" in log_text
+    if expected_status==404:
+        assert "auth.accepted" in log_text
+    elif expected_status in {401,403,503}:
+        assert "auth.rejected" in log_text
+    if expected_status==401:
+        assert response.headers.get("www-authenticate")=="Bearer"
+    if expected_status==403:
+        assert response.json()["error"]["code"]=="tenant_access_denied"
+    if expected_status==503:
+        assert response.json()["error"]["code"]=="identity_provider_unavailable"

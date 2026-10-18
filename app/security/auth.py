@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+from app.core.logging import event
 
 import jwt
 from jwt import PyJWKClient
@@ -28,6 +30,13 @@ class AuthenticationProviderUnavailable(Exception):
     """An identity provider could not establish the caller's current session."""
 
 
+class TenantAuthorizationDenied(Exception):
+    """A valid session does not have a verifiable active tenant membership."""
+
+
+_auth_logger = logging.getLogger("wellar.auth")
+
+
 class _NoRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -47,7 +56,7 @@ class DirectusAuthenticator:
         self.timeout = timeout
         self._opener = opener or build_opener(_NoRedirectHandler())
 
-    def _get_json(self, path: str, token: str) -> dict | None:
+    def _get_json(self, path: str, token: str, *, stage: str) -> dict | None:
         request = Request(
             self.base_url + path,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -55,28 +64,38 @@ class DirectusAuthenticator:
         )
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
+                event(_auth_logger, stage, status_code=response.status)
                 if response.status != 200:
-                    return None
+                    if response.status == 401:
+                        return None
+                    raise AuthenticationProviderUnavailable
                 raw = response.read(self._MAX_RESPONSE_BYTES + 1)
         except HTTPError as exc:
             exc.close()
-            if exc.code in {401, 403}:
+            event(_auth_logger, stage, status_code=exc.code)
+            if stage == "auth.membership_query_status" and exc.code == 403:
+                raise TenantAuthorizationDenied from None
+            if exc.code == 401:
                 return None
+            if exc.code == 403:
+                raise AuthenticationProviderUnavailable from None
             if exc.code == 429 or exc.code >= 500:
                 raise AuthenticationProviderUnavailable from None
             if 400 <= exc.code < 500:
-                # Endpoint/schema/permission configuration failures fail closed.
-                return None
+                # Endpoint/schema/configuration failures are not evidence of a bad session.
+                raise AuthenticationProviderUnavailable from None
             raise AuthenticationProviderUnavailable from None
         except (URLError, TimeoutError, OSError):
             raise AuthenticationProviderUnavailable from None
         if len(raw) > self._MAX_RESPONSE_BYTES:
-            return None
+            raise AuthenticationProviderUnavailable
         try:
             decoded = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return None
-        return decoded if isinstance(decoded, dict) else None
+            raise AuthenticationProviderUnavailable from None
+        if not isinstance(decoded, dict):
+            raise AuthenticationProviderUnavailable
+        return decoded
 
     @staticmethod
     def _relation_id(value) -> str | None:
@@ -88,15 +107,35 @@ class DirectusAuthenticator:
         if (not token or len(token) > 16_384
                 or any(ord(char) < 33 or ord(char) == 127 for char in token)):
             return None
-        user_response = self._get_json("/users/me?fields=id,status,active_business_profile", token)
-        user = user_response.get("data") if user_response else None
-        if not isinstance(user, dict) or user.get("status") != "active":
+        event(_auth_logger, "auth.directus_users_me_request")
+        user_response = self._get_json("/users/me?fields=id,status,active_business_profile", token,
+                                       stage="auth.directus_users_me_status")
+        if user_response is None:
             return None
+        user = user_response.get("data")
+        if not isinstance(user, dict):
+            event(_auth_logger, "auth.user_status_validation", error_code="response_unavailable")
+            raise AuthenticationProviderUnavailable
+        user_status = user.get("status")
+        if not isinstance(user_status, str) or not user_status:
+            event(_auth_logger, "auth.user_status_validation", error_code="field_unavailable")
+            raise AuthenticationProviderUnavailable
+        if user_status != "active":
+            event(_auth_logger, "auth.user_status_validation", error_code="inactive")
+            raise TenantAuthorizationDenied
+        event(_auth_logger, "auth.user_status_validation", error_code="active")
         subject_id = user.get("id")
         tenant_id = self._relation_id(user.get("active_business_profile"))
-        if (not isinstance(subject_id, str) or not subject_id or len(subject_id) > 256
-                or not tenant_id or len(tenant_id) > 256):
-            return None
+        if not isinstance(subject_id, str) or not subject_id or len(subject_id) > 256:
+            event(_auth_logger, "auth.user_status_validation", error_code="identity_field_unavailable")
+            raise AuthenticationProviderUnavailable
+        if "active_business_profile" not in user:
+            event(_auth_logger, "auth.active_business_profile_validation", error_code="field_unavailable")
+            raise AuthenticationProviderUnavailable
+        if not tenant_id or len(tenant_id) > 256:
+            event(_auth_logger, "auth.active_business_profile_validation", error_code="missing_or_invalid")
+            raise TenantAuthorizationDenied
+        event(_auth_logger, "auth.active_business_profile_validation", error_code="valid")
 
         query = urlencode({
             "fields": "id,user,business_profile,status",
@@ -105,16 +144,26 @@ class DirectusAuthenticator:
             "filter[status][_eq]": "active",
             "limit": "2",
         })
-        memberships_response = self._get_json("/items/business_profile_members?" + query, token)
+        memberships_response = self._get_json("/items/business_profile_members?" + query, token,
+                                              stage="auth.membership_query_status")
         rows = memberships_response.get("data") if memberships_response else None
-        if not isinstance(rows, list) or len(rows) != 1:
-            return None
+        if not isinstance(rows, list):
+            event(_auth_logger, "auth.membership_validation", error_code="response_unavailable")
+            raise AuthenticationProviderUnavailable
+        if len(rows) != 1:
+            event(_auth_logger, "auth.membership_validation", error_code="missing_or_ambiguous")
+            raise TenantAuthorizationDenied
         membership = rows[0]
-        if (not isinstance(membership, dict)
-                or membership.get("status") != "active"
+        if not isinstance(membership, dict) or any(
+                field not in membership for field in ("user", "business_profile", "status")):
+            event(_auth_logger, "auth.membership_validation", error_code="field_unavailable")
+            raise AuthenticationProviderUnavailable
+        if (membership.get("status") != "active"
                 or self._relation_id(membership.get("user")) != subject_id
                 or self._relation_id(membership.get("business_profile")) != tenant_id):
-            return None
+            event(_auth_logger, "auth.membership_validation", error_code="inactive_or_mismatched")
+            raise TenantAuthorizationDenied
+        event(_auth_logger, "auth.membership_validation", error_code="valid")
         return Principal(subject_id=subject_id, tenant_id=tenant_id)
 
 

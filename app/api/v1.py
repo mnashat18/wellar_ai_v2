@@ -15,7 +15,7 @@ from app.scans.labels import KSSLabelSubmission
 from app.scans.measurements import ClientMeasurements
 from app.drowsiness_indicator import classify as classify_drowsiness, load_thresholds, personal_closure_deviation, fresh_baseline_values
 from app.scans.service import ScanService
-from app.security.auth import AuthenticationProviderUnavailable, Principal, bearer
+from app.security.auth import AuthenticationProviderUnavailable, TenantAuthorizationDenied, Principal, bearer
 from app.compat.directus_facade import DirectusProcessRequest
 
 logger=logging.getLogger("wellar.api")
@@ -23,14 +23,23 @@ router=APIRouter(prefix="/api/v1")
 
 
 def get_principal(request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> Principal:
+    token_present=bool(credentials and credentials.credentials)
+    event(logger,"auth.token_present",error_code="present" if token_present else "missing")
     if not credentials:
+        event(logger,"auth.rejected",error_code="missing_bearer_token")
         raise HTTPException(401,detail="authentication required",headers={"WWW-Authenticate":"Bearer"})
     try:
         principal=request.app.state.authenticator.authenticate(credentials.credentials)
+    except TenantAuthorizationDenied:
+        event(logger,"auth.rejected",error_code="tenant_access_denied")
+        raise HTTPException(403,detail={"code":"tenant_access_denied","message":"Active workspace access could not be verified","retryable":False}) from None
     except AuthenticationProviderUnavailable:
+        event(logger,"auth.rejected",error_code="identity_provider_unavailable")
         raise HTTPException(503,detail={"code":"identity_provider_unavailable","message":"Identity service is temporarily unavailable","retryable":True}) from None
     if not principal:
+        event(logger,"auth.rejected",error_code="invalid_or_expired_token")
         raise HTTPException(401,detail="invalid credentials",headers={"WWW-Authenticate":"Bearer"})
+    event(logger,"auth.accepted")
     limiter=getattr(request.app.state,"rate_limiter",None)
     if limiter is not None:
         allowed,retry_after=limiter.consume(principal.tenant_id)
