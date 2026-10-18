@@ -93,7 +93,7 @@ class DirectusAuthenticator:
     def _get_json(self, path: str, token: str, *, stage: str) -> dict | None:
         request = Request(
             self.base_url + path,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": "WellarAI-V2/1.0"},
             method="GET",
         )
         try:
