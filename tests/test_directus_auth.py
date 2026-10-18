@@ -47,7 +47,7 @@ class FakeOpener:
 
 
 def user(subject="employee-1", tenant="company-1"):
-    return {"data": {"id": subject, "status": "active", "active_business_profile": tenant}}
+    return {"data": {"id": subject, "status": "active"}}
 
 
 def membership(subject="employee-1", tenant="company-1", status="active"):
@@ -65,12 +65,14 @@ def test_directus_authenticates_opaque_session_and_checks_membership_each_reques
     assert len(opener.requests) == 4
     assert all(req.get_header("Authorization") == "Bearer opaque-session-token" for req, _ in opener.requests)
     assert all(timeout == 3.0 for _, timeout in opener.requests)
+    user_me_url=urlparse(opener.requests[0][0].full_url)
+    assert user_me_url.path=="/users/me"
+    assert parse_qs(user_me_url.query)["fields"]==["id,status"]
     membership_url=urlparse(opener.requests[1][0].full_url)
     assert membership_url.path=="/items/business_profile_members"
     query=parse_qs(membership_url.query)
     assert query["fields"]==["id,user,business_profile,status"]
     assert query["filter[user][_eq]"]==["employee-1"]
-    assert query["filter[business_profile][_eq]"]==["company-1"]
     assert query["filter[status][_eq]"]==["active"]
 
 
@@ -84,6 +86,20 @@ def test_directus_rejects_inactive_user_mismatched_or_ambiguous_membership():
         auth.authenticate("opaque")
     with pytest.raises(TenantAuthorizationDenied):
         auth.authenticate("opaque")
+    with pytest.raises(TenantAuthorizationDenied):
+        auth.authenticate("opaque")
+
+
+def test_directus_denies_multiple_active_workspaces_without_choosing_one():
+    auth = DirectusAuthenticator("https://directus.example", opener=FakeOpener([
+        user(),
+        {"data": [
+            {"id": "membership-1", "user": "employee-1",
+             "business_profile": "company-1", "status": "active"},
+            {"id": "membership-2", "user": "employee-1",
+             "business_profile": "company-2", "status": "active"},
+        ]},
+    ]))
     with pytest.raises(TenantAuthorizationDenied):
         auth.authenticate("opaque")
 
@@ -120,7 +136,6 @@ def test_auth_diagnostics_report_stages_without_sensitive_values(caplog):
     assert "auth.directus_users_me_request" in text
     assert "auth.directus_users_me_status" in text
     assert "auth.user_status_validation" in text
-    assert "auth.active_business_profile_validation" in text
     assert "auth.membership_query_status" in text
     assert "auth.membership_validation" in text
     assert all(value not in text for value in secret_values)
@@ -131,15 +146,17 @@ def test_directus_rejection_stages_are_distinguished_in_safe_logs(caplog):
     cases = [
         ([HTTPError("https://directus.example/users/me", 401, "unauthorized", {}, None)], "auth.directus_users_me_status"),
         ([{"data": {"id": "employee-1", "status": "suspended", "active_business_profile": "company-1"}}], "auth.user_status_validation"),
-        ([{"data": {"id": "employee-1", "status": "active", "active_business_profile": None}}], "auth.active_business_profile_validation"),
+        ([{"data": {"id": "employee-1"}}], "auth.user_status_validation"),
         ([user(), membership(status="inactive")], "auth.membership_validation"),
-        ([user(), membership(tenant="another-company")], "auth.membership_validation"),
+        ([user(), membership(subject="another-user")], "auth.membership_validation"),
     ]
     for responses, expected_event in cases:
         caplog.clear()
         try:
             DirectusAuthenticator("https://directus.example", opener=FakeOpener(responses)).authenticate("safe-test-token")
         except TenantAuthorizationDenied:
+            pass
+        except AuthenticationProviderUnavailable:
             pass
         assert any(expected_event in record.getMessage() for record in caplog.records)
         assert "safe-test-token" not in caplog.text
@@ -227,9 +244,9 @@ def test_directus_outage_returns_redacted_retryable_service_error():
     ([HTTPError("https://directus.example/users/me", 401, "unauthorized", {}, None)], 401),
     ([{"data": {"id": "employee-1", "status": "suspended", "active_business_profile": "company-1"}}], 403),
     ([{"data": {"id": "employee-1", "active_business_profile": "company-1"}}], 503),
-    ([{"data": {"id": "employee-1", "status": "active"}}], 503),
-    ([{"data": {"id": "employee-1", "status": "active", "active_business_profile": None}}], 403),
-    ([user(), membership(tenant="another-company")], 403),
+    ([{"data": {"id": "employee-1", "status": "active"}}, {"data": []}], 403),
+    ([user(), membership(subject="another-user")], 403),
+    ([user(), membership(tenant="another-company")], 404),
     ([user(), membership(status="inactive")], 403),
     ([user(), HTTPError("https://directus.example/items/business_profile_members", 403, "forbidden", {}, None)], 403),
     ([user(), {"data": [{"id": "membership-1", "status": "active"}]}], 503),

@@ -108,7 +108,10 @@ class DirectusAuthenticator:
                 or any(ord(char) < 33 or ord(char) == 127 for char in token)):
             return None
         event(_auth_logger, "auth.directus_users_me_request")
-        user_response = self._get_json("/users/me?fields=id,status,active_business_profile", token,
+        # Match the working legacy identity probe. The expanded V2 field set
+        # returns 403 in the observed integration; resolve tenant only from
+        # the caller-authorized membership query below.
+        user_response = self._get_json("/users/me?fields=id,status", token,
                                        stage="auth.directus_users_me_status")
         if user_response is None:
             return None
@@ -125,23 +128,15 @@ class DirectusAuthenticator:
             raise TenantAuthorizationDenied
         event(_auth_logger, "auth.user_status_validation", error_code="active")
         subject_id = user.get("id")
-        tenant_id = self._relation_id(user.get("active_business_profile"))
         if not isinstance(subject_id, str) or not subject_id or len(subject_id) > 256:
             event(_auth_logger, "auth.user_status_validation", error_code="identity_field_unavailable")
             raise AuthenticationProviderUnavailable
-        if "active_business_profile" not in user:
-            event(_auth_logger, "auth.active_business_profile_validation", error_code="field_unavailable")
-            raise AuthenticationProviderUnavailable
-        if not tenant_id or len(tenant_id) > 256:
-            event(_auth_logger, "auth.active_business_profile_validation", error_code="missing_or_invalid")
-            raise TenantAuthorizationDenied
-        event(_auth_logger, "auth.active_business_profile_validation", error_code="valid")
-
         query = urlencode({
             "fields": "id,user,business_profile,status",
             "filter[user][_eq]": subject_id,
-            "filter[business_profile][_eq]": tenant_id,
             "filter[status][_eq]": "active",
+            # More than one active membership is ambiguous without exposing
+            # the restricted active_business_profile field. Fail closed.
             "limit": "2",
         })
         memberships_response = self._get_json("/items/business_profile_members?" + query, token,
@@ -158,9 +153,10 @@ class DirectusAuthenticator:
                 field not in membership for field in ("user", "business_profile", "status")):
             event(_auth_logger, "auth.membership_validation", error_code="field_unavailable")
             raise AuthenticationProviderUnavailable
+        tenant_id = self._relation_id(membership.get("business_profile"))
         if (membership.get("status") != "active"
                 or self._relation_id(membership.get("user")) != subject_id
-                or self._relation_id(membership.get("business_profile")) != tenant_id):
+                or not tenant_id or len(tenant_id) > 256):
             event(_auth_logger, "auth.membership_validation", error_code="inactive_or_mismatched")
             raise TenantAuthorizationDenied
         event(_auth_logger, "auth.membership_validation", error_code="valid")
