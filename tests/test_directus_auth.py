@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 import pytest
@@ -12,6 +13,7 @@ from app.main import create_app
 from app.security.auth import (
     AuthenticationProviderUnavailable,
     DirectusAuthenticator,
+    DirectusPermissionDenied,
     Principal,
     TenantAuthorizationDenied,
 )
@@ -44,6 +46,11 @@ class FakeOpener:
         if isinstance(result, Exception):
             raise result
         return FakeResponse(result)
+
+
+def directus_error(url, status, code):
+    body = json.dumps({"errors": [{"extensions": {"code": code}}]}).encode()
+    return HTTPError(url, status, "Directus error", {}, BytesIO(body))
 
 
 def user(subject="employee-1", tenant="company-1"):
@@ -118,7 +125,7 @@ def test_changed_directus_permission_denies_membership_lookup():
     ]))
     try:
         auth.authenticate("opaque")
-    except TenantAuthorizationDenied:
+    except DirectusPermissionDenied:
         pass
     else:
         raise AssertionError("membership permission denial must remain a tenant authorization error")
@@ -162,7 +169,7 @@ def test_directus_rejection_stages_are_distinguished_in_safe_logs(caplog):
         assert "safe-test-token" not in caplog.text
 
 
-def test_membership_permission_failure_maps_to_http_403():
+def test_membership_permission_failure_maps_to_nonretryable_gateway_error():
     settings = Settings(environment="test", db_path=":memory:", auth_mode="directus",
                         directus_url="https://directus.example")
     client = TestClient(create_app(settings=settings, authenticator=DirectusAuthenticator(
@@ -170,8 +177,8 @@ def test_membership_permission_failure_maps_to_http_403():
             user(), HTTPError("https://directus.example/items/business_profile_members", 403, "forbidden", {}, None)
         ]))))
     response = client.get("/api/v1/scans/any", headers={"Authorization": "Bearer opaque"})
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "tenant_access_denied"
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "directus_membership_permission_denied"
     assert "opaque" not in response.text
 
 
@@ -197,6 +204,64 @@ def test_directus_rate_limit_is_provider_unavailable_not_invalid_session():
         pass
     else:
         raise AssertionError("rate limiting must not be mistaken for an invalid token")
+
+
+def test_directus_invalid_token_code_maps_403_to_normal_auth_rejection(capsys):
+    settings = Settings(environment="test", db_path=":memory:", auth_mode="directus",
+                        directus_url="https://directus.example")
+    client = TestClient(create_app(settings=settings, authenticator=DirectusAuthenticator(
+        "https://directus.example", opener=FakeOpener([
+            directus_error("https://directus.example/users/me", 403, "INVALID_TOKEN"),
+        ]))))
+    response = client.get("/api/v1/scans/any", headers={"Authorization": "Bearer fake-token"})
+    logs = capsys.readouterr().err
+    assert response.status_code == 401
+    assert response.headers.get("www-authenticate") == "Bearer"
+    assert "fake-token" not in response.text + logs
+    assert '"processing_stage":"auth.directus_users_me_status"' in logs
+    assert '"directus_error_code":"INVALID_TOKEN"' in logs
+    assert '"error_code":"invalid_or_expired_token"' in logs
+
+
+@pytest.mark.parametrize("stage,url", [
+    ("auth.directus_users_me_status", "https://directus.example/users/me"),
+    ("auth.membership_query_status", "https://directus.example/items/business_profile_members"),
+])
+def test_directus_forbidden_is_permission_failure_not_invalid_token(stage, url):
+    results = ([directus_error(url, 403, "FORBIDDEN")] if stage == "auth.directus_users_me_status"
+               else [user(), directus_error(url, 403, "FORBIDDEN")])
+    auth = DirectusAuthenticator("https://directus.example", opener=FakeOpener(results))
+    with pytest.raises(DirectusPermissionDenied):
+        auth.authenticate("synthetic-token")
+
+
+def test_directus_forbidden_permission_failure_maps_to_nonretryable_gateway_error(capsys):
+    settings = Settings(environment="test", db_path=":memory:", auth_mode="directus",
+                        directus_url="https://directus.example")
+    client = TestClient(create_app(settings=settings, authenticator=DirectusAuthenticator(
+        "https://directus.example", opener=FakeOpener([
+            directus_error("https://directus.example/users/me", 403, "FORBIDDEN"),
+        ]))))
+    response = client.get("/api/v1/scans/any", headers={"Authorization": "Bearer synthetic-token"})
+    logs = capsys.readouterr().err
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "directus_identity_permission_denied"
+    assert response.json()["error"]["retryable"] is False
+    assert "synthetic-token" not in logs + response.text
+    assert "Directus error" not in logs + response.text
+    assert '"directus_error_code":"FORBIDDEN"' in logs
+    assert '"status_code":403' in logs
+
+
+def test_directus_invalid_token_at_membership_stage_maps_to_401():
+    settings = Settings(environment="test", db_path=":memory:", auth_mode="directus",
+                        directus_url="https://directus.example")
+    client = TestClient(create_app(settings=settings, authenticator=DirectusAuthenticator(
+        "https://directus.example", opener=FakeOpener([
+            user(), directus_error("https://directus.example/items/business_profile_members", 403, "INVALID_TOKEN"),
+        ]))))
+    response = client.get("/api/v1/scans/any", headers={"Authorization": "Bearer fake-token"})
+    assert response.status_code == 401
 
 
 def test_directus_invalid_payload_and_oversized_token_fail_closed():
@@ -248,9 +313,14 @@ def test_directus_outage_returns_redacted_retryable_service_error():
     ([user(), membership(subject="another-user")], 403),
     ([user(), membership(tenant="another-company")], 404),
     ([user(), membership(status="inactive")], 403),
-    ([user(), HTTPError("https://directus.example/items/business_profile_members", 403, "forbidden", {}, None)], 403),
+    ([user(), HTTPError("https://directus.example/items/business_profile_members", 403, "forbidden", {}, None)], 502),
     ([user(), {"data": [{"id": "membership-1", "status": "active"}]}], 503),
-    ([HTTPError("https://directus.example/users/me", 403, "forbidden", {}, None)], 503),
+    ([directus_error("https://directus.example/users/me", 403, "INVALID_TOKEN")], 401),
+    ([directus_error("https://directus.example/users/me", 403, "FORBIDDEN")], 502),
+    ([HTTPError("https://directus.example/users/me", 403, "forbidden", {}, None)], 502),
+    ([directus_error("https://directus.example/users/me", 503, "INVALID_TOKEN")], 503),
+    ([HTTPError("https://directus.example/users/me", 429, "limited", {}, None)], 503),
+    ([HTTPError("https://directus.example/users/me", 503, "unavailable", {}, None)], 503),
     ([URLError("provider unavailable")], 503),
 ])
 def test_directus_auth_status_mapping_and_safe_request_events(responses,expected_status,capsys):

@@ -15,7 +15,8 @@ from app.scans.labels import KSSLabelSubmission
 from app.scans.measurements import ClientMeasurements
 from app.drowsiness_indicator import classify as classify_drowsiness, load_thresholds, personal_closure_deviation, fresh_baseline_values
 from app.scans.service import ScanService
-from app.security.auth import AuthenticationProviderUnavailable, TenantAuthorizationDenied, Principal, bearer
+from app.security.auth import (AuthenticationProviderUnavailable, DirectusPermissionDenied,
+                               DirectusRequestRejected, TenantAuthorizationDenied, Principal, bearer)
 from app.compat.directus_facade import DirectusProcessRequest
 
 logger=logging.getLogger("wellar.api")
@@ -33,6 +34,12 @@ def get_principal(request: Request, credentials: HTTPAuthorizationCredentials | 
     except TenantAuthorizationDenied:
         event(logger,"auth.rejected",error_code="tenant_access_denied")
         raise HTTPException(403,detail={"code":"tenant_access_denied","message":"Active workspace access could not be verified","retryable":False}) from None
+    except DirectusPermissionDenied as exc:
+        event(logger,"auth.rejected",error_code=exc.error_code,processing_stage=exc.stage)
+        raise HTTPException(502,detail={"code":exc.error_code,"message":"Identity provider permissions do not allow this verification","retryable":False}) from None
+    except DirectusRequestRejected as exc:
+        event(logger,"auth.rejected",error_code=exc.error_code,processing_stage=exc.stage)
+        raise HTTPException(502,detail={"code":exc.error_code,"message":"Identity provider rejected the verification request","retryable":False}) from None
     except AuthenticationProviderUnavailable:
         event(logger,"auth.rejected",error_code="identity_provider_unavailable")
         raise HTTPException(503,detail={"code":"identity_provider_unavailable","message":"Identity service is temporarily unavailable","retryable":True}) from None

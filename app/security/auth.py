@@ -30,6 +30,28 @@ class AuthenticationProviderUnavailable(Exception):
     """An identity provider could not establish the caller's current session."""
 
 
+class DirectusPermissionDenied(Exception):
+    """Directus authenticated or evaluated the request but denied its permission."""
+
+    def __init__(self, stage: str):
+        self.stage = stage
+        self.error_code = (
+            "directus_identity_permission_denied"
+            if stage == "auth.directus_users_me_status"
+            else "directus_membership_permission_denied"
+        )
+        super().__init__(self.error_code)
+
+
+class DirectusRequestRejected(Exception):
+    """A non-authentication Directus 4xx rejected the configured request."""
+
+    def __init__(self, stage: str):
+        self.stage = stage
+        self.error_code = "directus_request_rejected"
+        super().__init__(self.error_code)
+
+
 class TenantAuthorizationDenied(Exception):
     """A valid session does not have a verifiable active tenant membership."""
 
@@ -48,6 +70,18 @@ class DirectusAuthenticator:
     No token parsing, service credential, permission cache, or privileged fallback is used.
     """
     _MAX_RESPONSE_BYTES = 64 * 1024
+    _MAX_ERROR_BYTES = 16 * 1024
+    _DIRECTUS_ERROR_CODES = {
+        "INVALID_TOKEN",
+        "TOKEN_EXPIRED",
+        "INVALID_CREDENTIALS",
+        "INVALID_IP",
+        "FORBIDDEN",
+        "REQUESTS_EXCEEDED",
+        "SERVICE_UNAVAILABLE",
+        "INVALID_QUERY",
+        "ROUTE_NOT_FOUND",
+    }
 
     def __init__(self, base_url: str, timeout: float = 3.0, opener=None):
         if not base_url or timeout <= 0:
@@ -64,27 +98,20 @@ class DirectusAuthenticator:
         )
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
-                event(_auth_logger, stage, status_code=response.status)
                 if response.status != 200:
-                    if response.status == 401:
+                    error_code = self._read_directus_error_code(response)
+                    if self._handle_error_status(response.status, stage, error_code):
                         return None
-                    raise AuthenticationProviderUnavailable
+                event(_auth_logger, stage, status_code=response.status)
                 raw = response.read(self._MAX_RESPONSE_BYTES + 1)
         except HTTPError as exc:
-            exc.close()
-            event(_auth_logger, stage, status_code=exc.code)
-            if stage == "auth.membership_query_status" and exc.code == 403:
-                raise TenantAuthorizationDenied from None
-            if exc.code == 401:
+            error_code = self._read_directus_error_code(exc)
+            try:
+                handled = self._handle_error_status(exc.code, stage, error_code)
+            finally:
+                exc.close()
+            if handled:
                 return None
-            if exc.code == 403:
-                raise AuthenticationProviderUnavailable from None
-            if exc.code == 429 or exc.code >= 500:
-                raise AuthenticationProviderUnavailable from None
-            if 400 <= exc.code < 500:
-                # Endpoint/schema/configuration failures are not evidence of a bad session.
-                raise AuthenticationProviderUnavailable from None
-            raise AuthenticationProviderUnavailable from None
         except (URLError, TimeoutError, OSError):
             raise AuthenticationProviderUnavailable from None
         if len(raw) > self._MAX_RESPONSE_BYTES:
@@ -96,6 +123,56 @@ class DirectusAuthenticator:
         if not isinstance(decoded, dict):
             raise AuthenticationProviderUnavailable
         return decoded
+
+    @classmethod
+    def _read_directus_error_code(cls, response) -> str | None:
+        """Read only Directus' bounded, enumerated error code; never retain its body."""
+        try:
+            raw = response.read(cls._MAX_ERROR_BYTES + 1)
+            if len(raw) > cls._MAX_ERROR_BYTES:
+                return "OTHER"
+            payload = json.loads(raw)
+            errors = payload.get("errors") if isinstance(payload, dict) else None
+            first = errors[0] if isinstance(errors, list) and errors else None
+            extensions = first.get("extensions") if isinstance(first, dict) else None
+            code = extensions.get("code") if isinstance(extensions, dict) else None
+            if isinstance(code, str) and code in cls._DIRECTUS_ERROR_CODES:
+                return code
+        except (AttributeError, OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return None
+
+    @staticmethod
+    def _handle_error_status(status: int, stage: str, directus_error_code: str | None) -> bool:
+        safe_code = directus_error_code or "UNKNOWN"
+        event(_auth_logger, stage, logging.WARNING, status_code=status,
+              directus_error_code=safe_code)
+        invalid_token_codes = {
+            "INVALID_TOKEN", "TOKEN_EXPIRED", "INVALID_CREDENTIALS", "INVALID_IP"
+        }
+        if status == 401 or (status == 403 and directus_error_code in invalid_token_codes):
+            event(_auth_logger, "auth.directus_session_rejected", logging.INFO,
+                  processing_stage=stage, status_code=status,
+                  directus_error_code=safe_code, error_code="invalid_or_expired_token")
+            return True
+        if status == 403:
+            # INVALID_TOKEN is a documented Directus 403 in some versions; an
+            # unqualified FORBIDDEN is a permission failure and stays distinct.
+            event(_auth_logger, "auth.directus_permission_denied", logging.WARNING,
+                  processing_stage=stage, status_code=status,
+                  directus_error_code=safe_code)
+            raise DirectusPermissionDenied(stage) from None
+        if status == 429 or status >= 500:
+            event(_auth_logger, "auth.directus_unavailable", logging.WARNING,
+                  processing_stage=stage, status_code=status,
+                  directus_error_code=safe_code)
+            raise AuthenticationProviderUnavailable from None
+        # Bad routes, queries, and other upstream contract errors are not
+        # authentication failures and must not be presented as retryable outages.
+        event(_auth_logger, "auth.directus_request_rejected", logging.ERROR,
+              processing_stage=stage, status_code=status,
+              directus_error_code=safe_code)
+        raise DirectusRequestRejected(stage) from None
 
     @staticmethod
     def _relation_id(value) -> str | None:
@@ -141,7 +218,9 @@ class DirectusAuthenticator:
         })
         memberships_response = self._get_json("/items/business_profile_members?" + query, token,
                                               stage="auth.membership_query_status")
-        rows = memberships_response.get("data") if memberships_response else None
+        if memberships_response is None:
+            return None
+        rows = memberships_response.get("data")
         if not isinstance(rows, list):
             event(_auth_logger, "auth.membership_validation", error_code="response_unavailable")
             raise AuthenticationProviderUnavailable
