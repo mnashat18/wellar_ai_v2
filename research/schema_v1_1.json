@@ -1,0 +1,533 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wellar-v2-research-manifest-1.1",
+  "title": "Wellar V2 de-identified research sample 1.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sample_id",
+    "participant_id",
+    "session_id",
+    "identity_linkage",
+    "provenance",
+    "consent",
+    "context",
+    "modality_availability",
+    "features",
+    "labels"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.1"
+    },
+    "fixture_marker": {
+      "const": "unit_test_synthetic",
+      "description": "Rejected by default; only for isolated software tests."
+    },
+    "sample_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "participant_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Pseudonym; identity linkage key must remain separately governed."
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identity_linkage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pseudonymized",
+        "linkage_key_stored_separately",
+        "linkage_governance_id"
+      ],
+      "properties": {
+        "pseudonymized": {
+          "const": true
+        },
+        "linkage_key_stored_separately": {
+          "const": true
+        },
+        "linkage_governance_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "study_id",
+        "dataset_id",
+        "dataset_version",
+        "source_reference",
+        "acquisition_protocol_id",
+        "curator_role"
+      ],
+      "properties": {
+        "study_id": {
+          "type": "string"
+        },
+        "dataset_id": {
+          "type": "string"
+        },
+        "dataset_version": {
+          "type": "string"
+        },
+        "source_reference": {
+          "type": "string"
+        },
+        "acquisition_protocol_id": {
+          "type": "string"
+        },
+        "curator_role": {
+          "type": "string"
+        }
+      }
+    },
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "permissions"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "granted",
+            "withdrawn",
+            "unknown"
+          ]
+        },
+        "permissions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "research_evaluation",
+            "model_training",
+            "cross_site_transfer"
+          ],
+          "properties": {
+            "research_evaluation": {
+              "type": "boolean"
+            },
+            "model_training": {
+              "type": "boolean"
+            },
+            "cross_site_transfer": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recorded_at_utc",
+        "site_id",
+        "device_id",
+        "industry",
+        "occupation"
+      ],
+      "properties": {
+        "recorded_at_utc": {
+          "type": "string"
+        },
+        "site_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "device_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "industry": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "occupation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "modality_availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "video",
+        "audio",
+        "image",
+        "reaction_task"
+      ],
+      "properties": {
+        "video": {
+          "$ref": "#/$defs/availability"
+        },
+        "audio": {
+          "$ref": "#/$defs/availability"
+        },
+        "image": {
+          "$ref": "#/$defs/availability"
+        },
+        "reaction_task": {
+          "$ref": "#/$defs/availability"
+        }
+      }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "video",
+        "audio",
+        "image",
+        "reaction_task"
+      ],
+      "properties": {
+        "video": {
+          "$ref": "#/$defs/featureEnvelope"
+        },
+        "audio": {
+          "$ref": "#/$defs/featureEnvelope"
+        },
+        "image": {
+          "$ref": "#/$defs/featureEnvelope"
+        },
+        "reaction_task": {
+          "$ref": "#/$defs/featureEnvelope"
+        }
+      }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reference_sleepiness",
+        "vigilance_performance",
+        "subjective_fatigue"
+      ],
+      "properties": {
+        "reference_sleepiness": {
+          "$ref": "#/$defs/sleepinessLabel"
+        },
+        "vigilance_performance": {
+          "$ref": "#/$defs/vigilanceLabel"
+        },
+        "subjective_fatigue": {
+          "$ref": "#/$defs/fatigueLabel"
+        }
+      }
+    },
+    "media_fingerprints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Optional local-only opaque fingerprints for leakage checks; do not export."
+    }
+  },
+  "$defs": {
+    "availability": {
+      "enum": [
+        "available",
+        "missing",
+        "failed",
+        "not_collected",
+        "unknown"
+      ]
+    },
+    "featureEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "values",
+        "provenance"
+      ],
+      "properties": {
+        "values": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "labelBase": {
+      "type": "object",
+      "required": [
+        "status",
+        "label_definition_id"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "observed",
+            "missing",
+            "unknown"
+          ]
+        },
+        "raw_value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "class_label": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "classification_rule_id": {
+          "type": "string"
+        },
+        "label_definition_id": {
+          "type": "string"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "source_reference": {
+          "type": "string"
+        },
+        "assessor_role": {
+          "type": "string"
+        },
+        "measured_at_utc": {
+          "type": "string"
+        },
+        "missing_reason": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "observed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "raw_value",
+              "unit",
+              "source_reference",
+              "assessor_role",
+              "measured_at_utc"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "missing",
+                  "unknown"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "missing_reason"
+            ],
+            "properties": {
+              "raw_value": {
+                "type": "null"
+              },
+              "class_label": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sleepinessLabel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/labelBase"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instrument": {
+              "enum": [
+                "KSS",
+                "unknown"
+              ]
+            },
+            "qualified": {
+              "type": "boolean"
+            },
+            "qualification_reference": {
+              "type": "string"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "instrument",
+                  "qualified",
+                  "qualification_reference"
+                ],
+                "properties": {
+                  "instrument": {
+                    "const": "KSS"
+                  },
+                  "qualified": {
+                    "const": true
+                  },
+                  "raw_value": {
+                    "minimum": 1,
+                    "maximum": 9
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "vigilanceLabel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/labelBase"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instrument": {
+              "enum": [
+                "PVT",
+                "unknown"
+              ]
+            },
+            "metric": {
+              "enum": [
+                "lapse_count",
+                "median_reaction_time_ms",
+                "reciprocal_mean_reaction_time_s"
+              ]
+            },
+            "protocol_id": {
+              "type": "string"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "instrument",
+                  "metric",
+                  "protocol_id"
+                ],
+                "properties": {
+                  "instrument": {
+                    "const": "PVT"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "fatigueLabel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/labelBase"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instrument": {
+              "type": "string",
+              "minLength": 1,
+              "not": {
+                "const": "KSS"
+              }
+            },
+            "qualified": {
+              "type": "boolean"
+            },
+            "qualification_reference": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "instrument",
+                  "qualified",
+                  "qualification_reference"
+                ],
+                "properties": {
+                  "qualified": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

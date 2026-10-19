@@ -1,0 +1,11 @@
+{
+  "target": "reference_sleepiness",
+  "feature_names": ["video.sampled_closed_fraction", "audio.ac_rms_dbfs"],
+  "seed": 2025,
+  "proportions": [0.7, 0.15, 0.15],
+  "learning_rate": 0.05,
+  "epochs": 250,
+  "l2": 0.001,
+  "min_confidence": 0.6,
+  "max_feature_missingness": 0.5
+}

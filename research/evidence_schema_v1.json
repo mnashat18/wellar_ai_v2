@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wellar-v2-multimodal-evidence-1.0",
+  "title": "Wellar multimodal research evidence envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scan_id", "modalities", "attention", "subjective_reference", "missing_modalities", "models", "fusion", "abstention_reasons"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "scan_id": {"type": "string"},
+    "modalities": {"type": "object", "additionalProperties": false, "required": ["image", "video", "audio"], "properties": {"image": {"$ref": "#/$defs/evidence"}, "video": {"$ref": "#/$defs/evidence"}, "audio": {"$ref": "#/$defs/evidence"}}},
+    "attention": {"$ref": "#/$defs/evidence"},
+    "subjective_reference": {"oneOf": [{"$ref": "#/$defs/evidence"}, {"type": "null"}]},
+    "missing_modalities": {"type": "array", "items": {"enum": ["image", "video", "audio", "attention", "subjective_reference"]}, "uniqueItems": true},
+    "models": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["name", "revision", "sha256", "license", "preprocessing", "labels"], "properties": {"name": {"type": "string"}, "revision": {"type": ["string", "null"]}, "sha256": {"type": ["string", "null"], "pattern": "^([a-fA-F0-9]{64})?$"}, "license": {"type": ["string", "null"]}, "preprocessing": {"type": ["string", "null"]}, "labels": {"type": ["array", "null"], "items": {"type": "string"}}}}},
+    "fusion": {"type": "object", "additionalProperties": false, "required": ["status", "model_revision", "calibration_status"], "properties": {"status": {"enum": ["inactive_no_validated_release", "candidate", "active"]}, "model_revision": {"type": ["string", "null"]}, "calibration_status": {"enum": ["not_calibrated", "candidate", "validated"]}}},
+    "abstention_reasons": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+  },
+  "$defs": {"evidence": {"type": "object", "additionalProperties": false, "required": ["status", "quality", "features", "provenance", "target_claim"], "properties": {"status": {"enum": ["available", "missing", "insufficient_quality", "failed", "not_collected"]}, "quality": {"type": "object"}, "features": {"type": "object"}, "provenance": {"type": "object"}, "target_claim": {"enum": ["descriptive_only", "self_report_only", "measured_task_performance", "validated_prediction", "none"]}}}}
+}

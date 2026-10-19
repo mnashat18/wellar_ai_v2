@@ -23,7 +23,6 @@ secrets/
 data/
 private-pilot/
 research_data/
-research/
 models/
 artifacts/
 *.wav
@@ -39,6 +38,76 @@ artifacts/
 *.pth
 *.pkl
 *.joblib
+
+# Research is denied by default; only individually reviewed source/docs/schemas
+# are visible. New files remain ignored until explicitly reviewed here.
+research/*
+!research/__init__.py
+!research/dataset_qualification.py
+!research/evaluation_v1.py
+!research/manifest_validation.py
+!research/media_feature_adapter.py
+!research/model_input_v1.py
+!research/pilot_dataset.py
+!research/pilot_lifecycle.py
+!research/regression_training.py
+!research/short_mobile_kss_v1.py
+!research/training.py
+!research/README.md
+!research/WELLAR_DATASET_MANIFEST_SPEC_V1.md
+!research/WELLAR_PHASE2_MEASUREMENT_DECISION_V1.md
+!research/WELLAR_PHASE3A_DATASET_AUDIT_AND_REVIEW_PACKAGE_V1.md
+!research/WELLAR_PHASE3C_DATASET_QUALIFICATION_V1.md
+!research/WELLAR_PHASE3F1_ATTENTIONBASE_AUDIT_V1.md
+!research/WELLAR_PILOT_PROTOCOL_V1.md
+!research/WELLAR_SCIENTIFIC_ACCEPTANCE_V1.md
+!research/evidence_schema_v1.json
+!research/protocol_v1.json
+!research/protocol_v1_1.json
+!research/schema_v1.json
+!research/schema_v1_1.json
+!research/schema_v1_2.json
+!research/training_config_v1.json
+research/public_data/
+
+# This integration bundle has copied third-party extractor code and is tied to
+# a participant-derived sample/model artifact whose complete rights manifest is
+# not cleared. Keep the entire bundle excluded until that review is complete.
+
+# Research datasets, generated outputs, and caches stay excluded at any depth.
+research/**/__pycache__/
+research/**/*.py[cod]
+research/**/*.csv
+research/**/*.rdata
+research/**/*.rda
+research/**/*.rds
+research/**/*.parquet
+research/**/*.arrow
+research/**/*.jsonl
+research/**/*.sqlite*
+research/**/*.db
+research/**/*.zip
+research/**/*.tar
+research/**/*.gz
+research/**/*.npy
+research/**/*.npz
+research/**/*.pkl
+research/**/*.pickle
+research/**/*.joblib
+research/**/*.pt
+research/**/*.pth
+research/**/*.onnx
+research/**/*.h5
+research/**/*.keras
+research/**/*.safetensors
+research/**/*.wav
+research/**/*.mp3
+research/**/*.mp4
+research/**/*.mov
+research/**/*.avi
+research/**/*.jpg
+research/**/*.jpeg
+research/**/*.png
 
 # Owner and local machine state.
 backups/

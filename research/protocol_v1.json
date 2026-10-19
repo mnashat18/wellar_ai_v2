@@ -1,0 +1,25 @@
+{
+  "status": "template_only_not_preregistered",
+  "protocol_id": "REPLACE_BEFORE_STUDY",
+  "version": "1.0",
+  "targets": ["reference_sleepiness", "vigilance_performance"],
+  "target_definitions": {
+    "reference_sleepiness": {"instrument": "qualified KSS", "qualification_standard": "REPLACE_BEFORE_STUDY", "label_timing_window": "REPLACE_BEFORE_STUDY", "classification_rule_id": "REPLACE_BEFORE_STUDY"},
+    "vigilance_performance": {"instrument": "PVT", "metric": "REPLACE_BEFORE_STUDY", "protocol_id": "REPLACE_BEFORE_STUDY", "classification_rule_id": "REPLACE_BEFORE_STUDY"}
+  },
+  "primary_metrics": {
+    "reference_sleepiness": ["balanced_accuracy", "macro_f1", "coverage", "calibration"],
+    "vigilance_performance": ["balanced_accuracy", "macro_f1", "coverage", "calibration"]
+  },
+  "split_policy": "participant-disjoint train/validation/test; site-disjoint and device-disjoint external assessments reported separately",
+  "inclusion_criteria": ["documented consent and explicit research-evaluation permission", "qualified independent reference labels", "documented feature provenance and acquisition context"],
+  "exclusion_criteria": ["withdrawn or unknown consent", "unqualified reference labels", "unresolvable provenance", "duplicate/leaking participant or media fingerprints"],
+  "missing_data_policy": "report missingness per modality and target; do not impute labels or treat missing as negative",
+  "abstention_policy": "freeze threshold on validation data; report coverage and selective risk on holdout",
+  "subgroup_policy": {"dimensions": ["site_id", "device_id", "industry"], "minimum_participants": 20, "minimum_per_class": 5, "small_group_handling": "suppress metrics"},
+  "calibration_policy": "report multiclass Brier score and top-label expected calibration error; any calibration map is fit on training/validation only",
+  "held_out_test_policy": {"one_time_evaluation": true, "previously_inspected_data_reused_as_locked_test": false, "custodian_unblinded_until_protocol_and_artifact_hash_are_frozen": true},
+  "analysis_code_version": "research.evaluation_v1",
+  "sample_size_and_power_analysis": "REPLACE_BEFORE_STUDY",
+  "notes": "This template is not a registered protocol. Specify the qualified KSS definition, PVT protocol/metric, class thresholds, uncertainty method, sample-size power analysis, and acceptance criteria before enrolling or opening a held-out test set."
+}
