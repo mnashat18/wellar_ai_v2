@@ -11,6 +11,7 @@ from app.core.logging import event
 
 import jwt
 from jwt import PyJWKClient
+from jwt.exceptions import PyJWKClientConnectionError
 
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -275,9 +276,13 @@ class JWTAuthenticator:
             subject,tenant=claims.get("sub"),claims.get(self.tenant_claim)
             if not isinstance(subject,str) or not subject or not isinstance(tenant,str) or not tenant:return None
             return Principal(subject_id=subject,tenant_id=tenant)
+        except PyJWKClientConnectionError:
+            # A JWKS transport outage is an identity-provider availability
+            # failure, not evidence that the caller's token is invalid.
+            raise AuthenticationProviderUnavailable from None
         except Exception:
-            # JWKS transport/client failures must fail closed just like invalid tokens.
-            # Provider exception messages are intentionally neither returned nor logged.
+            # Invalid tokens and non-transport verification failures remain
+            # rejected. Exception details are intentionally neither returned nor logged.
             return None
 
 

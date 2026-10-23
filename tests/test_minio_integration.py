@@ -171,20 +171,24 @@ def test_minio_delete_retry_and_report_only_orphan_detection(live_minio, store, 
         assert not storage.delete(reference,"other-tenant-"+namespace,subject_id)
         assert not storage.delete(reference,tenant_id,other_subject)
 
-        real_delete=client.delete_object
+        import app.media.s3_storage as s3_module
+        real_delete=s3_module.run_bounded_storage_action
         state={"calls":0}
-        def fail_once(**kwargs):
-            state["calls"]+=1
-            if state["calls"]==1:raise RuntimeError("synthetic one-time delete outage")
-            return real_delete(**kwargs)
-        monkeypatch.setattr(client,"delete_object",fail_once)
+        def fail_once_after_delete(request,timeout_seconds):
+            if request.get("action")=="s3_delete":
+                state["calls"]+=1
+                result=real_delete(request,timeout_seconds)
+                if state["calls"]==1:raise RuntimeError("synthetic lost delete response")
+                return result
+            return real_delete(request,timeout_seconds)
+        monkeypatch.setattr(s3_module,"run_bounded_storage_action",fail_once_after_delete)
         from app.core.errors import WellarError
         with pytest.raises(WellarError) as failed:
             storage.delete(reference,tenant_id,subject_id)
         assert failed.value.code=="object_storage_unavailable"
         assert store.get_media_by_ref(reference,tenant_id,subject_id) is not None
-        assert storage.resolve(reference,tenant_id,subject_id)["available"]
-        monkeypatch.setattr(client,"delete_object",real_delete)
+        with pytest.raises(WellarError):storage.resolve(reference,tenant_id,subject_id)
+        monkeypatch.setattr(s3_module,"run_bounded_storage_action",real_delete)
         assert storage.delete(reference,tenant_id,subject_id)
         assert not storage.delete(reference,tenant_id,subject_id)
         assert store.get_media_by_ref(reference,tenant_id,subject_id) is None
@@ -200,7 +204,6 @@ def test_minio_delete_retry_and_report_only_orphan_detection(live_minio, store, 
         assert client.head_object(Bucket=bucket,Key=orphan_key)["ContentLength"]==len(b"synthetic orphan fixture")
     finally:
         # Cleanup targets only this test's generated keys and own metadata reference.
-        monkeypatch.setattr(client,"delete_object",getattr(client,"delete_object"))
         try:
             client.delete_object(Bucket=bucket,Key=orphan_key)
         except Exception:

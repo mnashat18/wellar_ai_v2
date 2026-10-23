@@ -10,11 +10,11 @@ import pytest
 
 from app.workers.worker import Worker
 from app.core.logging import JsonFormatter
-from tests.media_fixtures import image_bytes,png_dimension_bomb,video_file,wav_bytes
+from tests.media_fixtures import image_bytes,png_dimension_bomb,synthetic_face_image_bytes,video_file,wav_bytes
 from app.media.extractors import temporal_eye_features
 
 AUTH={"Authorization":"Bearer token-a"}
-CONSENT={"media_processing":True,"research_use":True}
+CONSENT={"media_processing":True,"consent_version":"operational-media-v1","research_use":False}
 
 
 def upload(client,kind,data,content_type):
@@ -55,15 +55,27 @@ def test_idempotency_keys_are_scoped_to_verified_tenant_and_subject(client,auth)
 
 def test_operational_media_processing_does_not_require_research_use(client,auth):
     ref=upload(client,"audio",wav_bytes(),"audio/wav").json()["media_ref"]
-    body={"schema_version":"1.0","media_refs":[ref],"reaction_task":None,"consent":{"media_processing":True,"research_use":False}}
+    body={"schema_version":"1.0","media_refs":[ref],"reaction_task":None,"consent":CONSENT}
     response=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"operational-consent"},json=body)
     assert response.status_code==202
     assert response.json()["status"]=="queued"
+    payload=client.app.state.store.db.execute("SELECT payload_json FROM scans WHERE scan_id=?",(response.json()["scan_id"],)).fetchone()[0]
+    import json
+    assert json.loads(payload)["consent"]==CONSENT
+
+
+def test_media_consent_requires_supported_version_and_research_stays_disabled(client,auth):
+    ref=upload(client,"audio",wav_bytes(),"audio/wav").json()["media_ref"]
+    base={"schema_version":"1.0","media_refs":[ref],"reaction_task":None}
+    headers={**auth,"Idempotency-Key":"versioned-consent"}
+    assert client.post("/api/v1/scans",headers=headers,json={**base,"consent":{"media_processing":True,"research_use":False}}).status_code==422
+    assert client.post("/api/v1/scans",headers=headers,json={**base,"consent":{**CONSENT,"consent_version":"future-copy-v2"}}).status_code==422
+    assert client.post("/api/v1/scans",headers=headers,json={**base,"consent":{**CONSENT,"research_use":True}}).status_code==422
 
 
 def test_processing_consent_false_is_rejected_even_when_research_permission_true(client,auth):
     ref=upload(client,"audio",wav_bytes(),"audio/wav").json()["media_ref"]
-    body={"schema_version":"1.0","media_refs":[ref],"reaction_task":None,"consent":{"media_processing":False,"research_use":True}}
+    body={"schema_version":"1.0","media_refs":[ref],"reaction_task":None,"consent":{"media_processing":False,"consent_version":"operational-media-v1","research_use":False}}
     assert client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"processing-consent-denied"},json=body).status_code==422
 
 
@@ -137,6 +149,63 @@ def test_media_scan_requires_explicit_consent_and_records_owned_reference(client
     assert body["targets"]["reference_sleepiness"]["value"] is None
 
 
+def test_combined_image_video_audio_result_is_versioned_and_abstains(client,auth,tmp_path):
+    image_ref=upload(client,"image",synthetic_face_image_bytes(),"image/png").json()["media_ref"]
+    video_ref=upload(client,"video",video_file(tmp_path/"combined.avi"),"video/x-msvideo").json()["media_ref"]
+    audio_ref=upload(client,"audio",wav_bytes(),"audio/wav").json()["media_ref"]
+    accepted=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"combined-modalities"},json={
+        "schema_version":"1.0","media_refs":[image_ref,video_ref,audio_ref],"reaction_task":None,"consent":CONSENT,
+    })
+    assert accepted.status_code==202
+    assert Worker(client.app.state.store,"combined-modalities-worker",client.app.state.worker_processor).run_once()
+    result=client.get(f"/api/v1/scans/{accepted.json()['scan_id']}/result",headers=auth).json()
+    assert result["schema_version"]=="2.0"
+    assert {name:result["features"][name]["presence"] for name in ("image","video","audio")}=={
+        "image":"present","video":"present","audio":"present",
+    }
+    assert result["features"]["image"]["extraction_status"]=="available"
+    assert result["features"]["image"]["provenance"]["extractor"]=="opencv_image_quality_mediapipe_face_mesh_visibility"
+    assert result["features"]["video"]["extraction_status"]=="insufficient_quality"
+    assert result["features"]["video"]["quality"]["reason"]=="face_not_detected"
+    assert result["features"]["audio"]["extraction_status"]=="available"
+    assert result["features"]["audio"]["features"]["voice_activity_status"]=="speech_like_activity_heuristic"
+    assert result["features"]["audio"]["provenance"]["extractor"]=="python_wave_pcm_acoustic_summary_spectral_vad_heuristic"
+    assert result["status"]=="insufficient_evidence"
+    assert result["evidence"]["fusion"]["status"]=="inactive_no_validated_release"
+    assert result["evidence"]["research_model_compatibility"]["fatigue"]["status"]=="abstained"
+    assert result["evidence"]["research_model_compatibility"]["vigilance"]["status"]=="abstained"
+    assert result["drowsiness_indicator"]["status"]=="not_performed"
+    assert all(target["value"] is None for target in result["targets"].values())
+    assert result["prediction_extension"]["inference_status"]=="disabled"
+    assert result["measurements"]["fatigue"]["status"]=="unavailable"
+    assert result["measurements"]["vigilance"]["status"]=="not_provided"
+
+
+def test_processing_retry_keeps_media_until_result_commit(client,auth,monkeypatch):
+    ref=upload(client,"audio",wav_bytes(),"audio/wav").json()["media_ref"]
+    accepted=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"retry-keeps-media"},json={
+        "schema_version":"1.0","media_refs":[ref],"reaction_task":None,"consent":CONSENT,
+    })
+    assert accepted.status_code==202
+
+    from app.media.isolated_decode import DecodeChildError
+
+    def fail_decode(*_args,**_kwargs):
+        raise DecodeChildError("synthetic decode child failure")
+
+    monkeypatch.setattr("app.media.analysis.run_killable",fail_decode)
+    worker=Worker(client.app.state.store,"retry-media-worker",client.app.state.worker_processor)
+    assert worker.run_once()
+    assert client.app.state.store.get_scan(accepted.json()["scan_id"],"tenant-a","user-a")["status"]=="queued"
+    assert client.app.state.media_store.resolve(ref,"tenant-a","user-a") is not None
+
+    monkeypatch.undo()
+    time.sleep(.01)
+    assert worker.run_once()
+    assert client.app.state.store.get_scan(accepted.json()["scan_id"],"tenant-a","user-a")["status"]=="completed"
+    assert client.app.state.media_store.resolve(ref,"tenant-a","user-a") is None
+
+
 def test_invalid_decode_and_partial_modality_failure_are_distinct(client,auth):
     bad=upload(client,"image",b"\xff\xd8\xffnot-a-real-jpeg","image/jpeg")
     good=upload(client,"audio",wav_bytes(),"audio/wav")
@@ -158,13 +227,18 @@ def test_invalid_decode_and_partial_modality_failure_are_distinct(client,auth):
 def test_black_image_and_silent_audio_are_insufficient_quality(client,auth):
     iref=upload(client,"image",image_bytes(),"image/jpeg").json()["media_ref"]
     aref=upload(client,"audio",wav_bytes(silence=True),"audio/wav").json()["media_ref"]
-    accepted=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"poor-quality"},json={"schema_version":"1.0","media_refs":[iref,aref],"reaction_task":None,"consent":CONSENT})
+    task={"task_type":"simple_reaction","trials":[{"trial_index":i,"stimulus_timestamp_ms":10000+i*5000,"response_timestamp_ms":10300+i*5000} for i in range(3)]}
+    accepted=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"poor-quality"},json={"schema_version":"1.0","media_refs":[iref,aref],"reaction_task":task,"consent":CONSENT})
     assert accepted.status_code==202
     Worker(client.app.state.store,"quality-test",client.app.state.worker_processor).run_once()
     result=client.get(f"/api/v1/scans/{accepted.json()['scan_id']}/result",headers=auth).json()
     assert result["features"]["image"]["extraction_status"]=="insufficient_quality"
     assert result["features"]["image"]["quality"]["reason"]=="face_not_detected"
+    assert result["features"]["image"]["provenance"]["version"]=="mediapipe-0.10.21-opencv-4.10.0"
     assert result["features"]["audio"]["extraction_status"]=="insufficient_quality"
+    assert result["measurements"]["fatigue"]["status"]=="unavailable"
+    assert result["measurements"]["vigilance"]["status"]=="observed_unverified"
+    assert result["measurements"]["vigilance"]["value"]["valid_trial_count"]==3
 
 
 def test_image_decompression_pixel_limit_rejected_by_extractor(client,auth):
@@ -259,8 +333,13 @@ def test_reaction_task_validates_order_and_marks_client_report_unverified(client
     Worker(client.app.state.store,"reaction-test",client.app.state.worker_processor).run_once()
     result=client.get(f"/api/v1/scans/{accepted.json()['scan_id']}/result",headers=auth).json()
     feature=result["features"]["reaction_task"]["features"]
+    assert feature["valid_reaction_times_ms"] == [320, 321, 322, 323]
     assert feature["integrity_status"]=="unverified_client_report" and feature["server_verified"] is False
     assert result["status"]=="insufficient_evidence"
+    assert result["measurements"]["fatigue"]["status"]=="unavailable"
+    assert result["measurements"]["vigilance"]["status"]=="observed_unverified"
+    assert result["measurements"]["vigilance"]["value"]["valid_trial_count"]==4
+    assert result["measurements"]["vigilance"]["value"]["device_timestamp_reliability"]["server_verified"] is False
     invalid={**task,"trials":[task["trials"][0],task["trials"][0]]}
     response=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"reaction-invalid"},json={"schema_version":"1.0","media_refs":[],"reaction_task":invalid,"consent":CONSENT})
     assert response.status_code==422
@@ -274,17 +353,24 @@ def test_reaction_metrics_keep_omissions_false_starts_and_optional_subjective_re
         {"trial_index":3,"stimulus_timestamp_ms":400,"response_timestamp_ms":650},
     ]}
     body={"schema_version":"1.0","media_refs":[],"reaction_task":task,"consent":CONSENT,
-          "subjective_fatigue":{"score":7,"collection_consent":True}}
+          "subjective_fatigue":{"score":7,"collection_consent":True,"question_version":"wellar-fatigue-self-report/1.0"}}
     accepted=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"reaction-self-report"},json=body)
     assert accepted.status_code==202
     Worker(client.app.state.store,"reaction-self-report",client.app.state.worker_processor).run_once()
     result=client.get(f"/api/v1/scans/{accepted.json()['scan_id']}/result",headers=auth).json()
     feature=result["features"]["reaction_task"]["features"]
     assert feature["omission_count"]==1 and feature["false_start_count"]==1
+    # Trial 1 responded after trial 2's stimulus, so it is an attribution
+    # anomaly and must not be combined with the valid final-trial RT.
+    assert feature["valid_reaction_times_ms"] == [250]
+    assert feature["ambiguous_timestamp_count"] == 1
     assert feature["pvt_equivalence"]=="not_established"
     assert feature["timing_metadata"]["device_clock_resolution_ms"]==8
     assert result["subjective_reference"]["score"]==7
     assert result["subjective_reference"]["training_consent"] is False
+    assert result["measurements"]["fatigue"]["status"]=="observed_self_report"
+    assert result["measurements"]["fatigue"]["value"] == 7
+    assert result["measurements"]["fatigue"]["question"] == "Right now, how physically or mentally fatigued do you feel before starting work?"
     assert result["evidence"]["schema_version"]=="1.2"
     assert result["evidence"]["fusion"]["status"]=="inactive_no_validated_release"
     assert "video" in result["evidence"]["missing_modalities"]

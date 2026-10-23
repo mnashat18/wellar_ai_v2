@@ -39,6 +39,8 @@ def test_no_confidence_or_accuracy_and_optional_baseline_is_fail_closed():
     result = classify(measures(), baseline_z_score=2.0, prior_scans=5, minimum_prior_scans=5)
     assert result["personal_baseline"]["z_score"] == 2.0
     assert result["label"] == "indicative, non-diagnostic, not a validated classifier"
+    assert result["scope"] == "research_only_non_production"
+    assert result["production_prediction"] is False
     assert result["config_sha256"] and result["config_version"] == "1.0"
 
 

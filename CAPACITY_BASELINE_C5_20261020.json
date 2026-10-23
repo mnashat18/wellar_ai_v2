@@ -1,0 +1,233 @@
+{
+  "accepted": 5,
+  "benchmark": "wellar_v2_postgres_minio_real_http",
+  "cohorts": [
+    {
+      "accepted": 5,
+      "accepted_scans_per_second": 1.915,
+      "completed": 5,
+      "concurrency": 5,
+      "elapsed_seconds": 2.611,
+      "failed": 0,
+      "failed_scan_end_to_end_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "sample_count": 0
+      },
+      "failed_upload_request_latency_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "sample_count": 0
+      },
+      "failure_codes": {},
+      "queue_depth_trace": {
+        "max_oldest_queued_age_seconds": 0.146,
+        "max_queued": 2,
+        "max_running": 2,
+        "max_terminal_failures": 0,
+        "sample_count": 9,
+        "sample_interval_ms": 250
+      },
+      "queue_snapshot_after_cohort": {
+        "oldest_queued_age_seconds": null,
+        "queued": 0,
+        "retries": 0,
+        "running": 0,
+        "terminal_failures": 0
+      },
+      "repetition": 1,
+      "scan_attempts": 5,
+      "scan_submission_requests": 5,
+      "submit_to_result_visible_ms": {
+        "p50": 521.792,
+        "p95": 2130.636,
+        "p99": 2130.636,
+        "sample_count": 5
+      },
+      "submit_to_terminal_ms": {
+        "p50": 511.013,
+        "p95": 2099.478,
+        "p99": 2099.478,
+        "sample_count": 5
+      },
+      "throughput_scans_per_second": 1.915,
+      "timeouts": 0,
+      "upload_start_to_result_visible_ms": {
+        "p50": 1101.216,
+        "p95": 2562.091,
+        "p99": 2562.091,
+        "sample_count": 5
+      }
+    }
+  ],
+  "completed": 5,
+  "concurrent_idempotency": {
+    "accepted": 0,
+    "created": 0,
+    "distinct_scan_ids": 0,
+    "requests": 0,
+    "skipped": true
+  },
+  "configuration": {
+    "cohorts": [
+      5
+    ],
+    "configured_upload_slots_from_env": 4,
+    "deadline_seconds": 90.0,
+    "idempotency_replay_skipped": true,
+    "media": [
+      "image/jpeg",
+      "video/mp4",
+      "audio/wav"
+    ],
+    "repetitions": 1,
+    "synthetic_fixture_bytes": {
+      "audio": 32044,
+      "image": 2359,
+      "video": 1575
+    },
+    "worker_count_reported_by_operator": 1,
+    "worker_scaling_performed_by_harness": false
+  },
+  "credential_free": true,
+  "duration_seconds": 3.193,
+  "endpoint_class": "fixed_loopback_sprint08_compose",
+  "failed": 0,
+  "failure_types": {},
+  "http_429_responses_by_endpoint_reason": {
+    "media_upload:audio:upload_capacity_exceeded": 1,
+    "media_upload:image:upload_capacity_exceeded": 1
+  },
+  "http_429_responses_total": 2,
+  "http_requests_by_endpoint": {
+    "media_delete": 15,
+    "media_upload:audio": 6,
+    "media_upload:image": 6,
+    "media_upload:video": 5,
+    "readiness_queue_sample": 9,
+    "readiness_queue_snapshot": 1,
+    "result_retrieval": 5,
+    "scan_status_poll": 30,
+    "scan_submission": 5
+  },
+  "internet_used": false,
+  "latency_ms": {
+    "failed_scan_end_to_end": {
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "sample_count": 0
+    },
+    "failed_submit_request": {
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "sample_count": 0
+    },
+    "failed_upload_request": {
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "sample_count": 0
+    },
+    "requests": {
+      "cleanup": {
+        "p50": 16.957,
+        "p95": 39.645,
+        "p99": 39.645,
+        "sample_count": 15
+      },
+      "poll": {
+        "p50": 15.615,
+        "p95": 67.632,
+        "p99": 82.892,
+        "sample_count": 30
+      },
+      "queue_sampler": {
+        "p50": 21.282,
+        "p95": 178.083,
+        "p99": 178.083,
+        "sample_count": 9
+      },
+      "result_get": {
+        "p50": 13.742,
+        "p95": 31.033,
+        "p99": 31.033,
+        "sample_count": 5
+      },
+      "submit": {
+        "p50": 152.617,
+        "p95": 156.783,
+        "p99": 156.783,
+        "sample_count": 5
+      },
+      "upload_audio": {
+        "p50": 91.876,
+        "p95": 204.539,
+        "p99": 204.539,
+        "sample_count": 6
+      },
+      "upload_image": {
+        "p50": 170.156,
+        "p95": 183.067,
+        "p99": 183.067,
+        "sample_count": 6
+      },
+      "upload_video": {
+        "p50": 123.756,
+        "p95": 127.689,
+        "p99": 127.689,
+        "sample_count": 5
+      }
+    },
+    "successful_submit_to_result_visible": {
+      "p50": 521.792,
+      "p95": 2130.636,
+      "p99": 2130.636,
+      "sample_count": 5
+    },
+    "successful_submit_to_terminal": {
+      "p50": 511.013,
+      "p95": 2099.478,
+      "p99": 2099.478,
+      "sample_count": 5
+    },
+    "successful_upload_start_to_result_visible": {
+      "p50": 1101.216,
+      "p95": 2562.091,
+      "p99": 2562.091,
+      "sample_count": 5
+    }
+  },
+  "limitations": [
+    "single host and local Compose stack only",
+    "no inference or scientific validity claim",
+    "queue snapshots are sampled after each cohort",
+    "container resource telemetry is not collected by this HTTP harness",
+    "a server-side object whose upload response was lost has no safe client-visible media_ref and is left to retention/operator reconciliation"
+  ],
+  "machine": {
+    "architecture": "AMD64",
+    "cpu": "Intel64 Family 6 Model 158 Stepping 9, GenuineIntel",
+    "logical_processors": 8,
+    "os": "Windows-10-10.0.26100-SP0"
+  },
+  "media_cleanup": {
+    "assets_retained_for_unresolved_scans": 0,
+    "delete_failures": 0,
+    "unknown_refs_after_ambiguous_upload_failure": true
+  },
+  "retry_429_count": 2,
+  "run_finished_at_utc": "2026-10-20T11:01:15.508094+00:00",
+  "run_started_at_utc": "2026-10-20T11:01:12.314881+00:00",
+  "scan_attempts": 5,
+  "scan_submission_requests": 5,
+  "synthetic_only": true,
+  "timeouts": 0,
+  "worker_events": {
+    "available": false,
+    "reason": "container_logs_unavailable"
+  }
+}

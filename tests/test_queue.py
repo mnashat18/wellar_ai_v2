@@ -222,3 +222,67 @@ def test_worker_stops_cleanly_without_claiming_more_work(store):
     stop=threading.Event();worker=Worker(store,"shutdown-worker")
     stop.set();worker.run_forever(stop,idle_seconds=.01)
     assert store.db.execute("select count(*) from jobs where status='running'").fetchone()[0]==0
+
+
+def test_single_host_sqlite_workers_process_distinct_claims_concurrently(store):
+    """Exercise SQLite's single-host claim locking; this is not distributed validation."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    worker_count=4
+    for index in range(worker_count):submit(store,f"local-worker-{index}")
+    barrier=threading.Barrier(worker_count)
+    lock=threading.Lock()
+    state={"active":0,"peak":0}
+    def processor(_payload):
+        with lock:
+            state["active"]+=1
+            state["peak"]=max(state["peak"],state["active"])
+        try:
+            barrier.wait(timeout=5)
+            return {"status":"completed"}
+        finally:
+            with lock:state["active"]-=1
+    workers=[Worker(store,f"local-worker-{index}",processor) for index in range(worker_count)]
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        outcomes=list(pool.map(lambda worker:worker.run_once(),workers))
+
+    assert outcomes==[True]*worker_count
+    assert state["peak"]==worker_count
+    assert store.db.execute("SELECT count(*) FROM jobs WHERE status='completed'").fetchone()[0]==worker_count
+    owners={row[0] for row in store.db.execute("SELECT worker_id FROM jobs WHERE status='completed'").fetchall()}
+    assert owners=={f"local-worker-{index}" for index in range(worker_count)}
+
+
+def test_single_host_sqlite_racing_claims_have_one_lease_owner(store):
+    """Validate local SQLite locking only; PostgreSQL process races need live integration."""
+    from concurrent.futures import ThreadPoolExecutor
+    submit(store,"claim-race")
+    worker_count=8
+    barrier=threading.Barrier(worker_count)
+    def claim(index):
+        barrier.wait(timeout=3)
+        return store.claim(f"claim-racer-{index}")
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        claims=list(pool.map(claim,range(worker_count)))
+    owners=[job["worker_id"] for job in claims if job is not None]
+    assert len(owners)==1
+    assert store.db.execute("SELECT count(*) FROM jobs WHERE status='running'").fetchone()[0]==1
+
+
+def test_worker_shutdown_drains_active_job_without_claiming_another(store):
+    entered=threading.Event();release=threading.Event();stop=threading.Event()
+    submit(store,"shutdown-drain-one");submit(store,"shutdown-drain-two")
+    def processor(_payload):
+        entered.set()
+        assert release.wait(timeout=5)
+        return {"status":"completed"}
+    worker=Worker(store,"draining-worker",processor)
+    thread=threading.Thread(target=worker.run_forever,args=(stop,),kwargs={"idle_seconds":0.01})
+    thread.start()
+    assert entered.wait(timeout=2)
+    stop.set()
+    assert thread.is_alive()
+    release.set();thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert store.db.execute("SELECT count(*) FROM jobs WHERE status='completed'").fetchone()[0]==1
+    assert store.db.execute("SELECT count(*) FROM jobs WHERE status='queued'").fetchone()[0]==1

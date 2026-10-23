@@ -187,10 +187,10 @@ def test_constant_dc_audio_is_not_accepted_as_useful_signal(tmp_path):
 
     extracted = extract_audio(path, max_seconds=10)
     assert extracted["status"] == "insufficient_quality"
-    assert extracted["quality"]["reason"] == "short_silent_dc_offset_or_clipped_recording"
+    assert extracted["quality"]["reason"] == "silence_detected"
     assert extracted["features"]["ac_rms_dbfs"] < -200
     assert extracted["features"]["dc_offset_max"] > 0.2
-    assert extracted["provenance"]["quality_scope"] == "signal_integrity_only_speech_noise_and_ood_not_assessed"
+    assert extracted["provenance"]["quality_scope"] == "signal_integrity_and_conservative_speech_like_activity_only_noise_music_and_ood_not_classified"
 
 
 def test_one_frame_video_is_not_marked_temporally_usable(tmp_path, monkeypatch):

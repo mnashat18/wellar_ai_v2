@@ -35,6 +35,21 @@ def _decode_media(modality: str, path: str, limits: dict):
     raise InvalidMediaError("unsupported_media_modality")
 
 
+def _warm_media_runtime():
+    """Validate native image/video runtime and bundled Face Mesh assets at startup."""
+    import cv2
+    import mediapipe as mp
+    import numpy as np
+    from app.media.extractors import _face_mesh_factory
+
+    frame=np.zeros((64,64,3),dtype=np.uint8)
+    for static_image_mode in (True,False):
+        mesh=_face_mesh_factory(static_image_mode=static_image_mode)
+        try:mesh.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
+        finally:mesh.close()
+    return {"opencv_version":cv2.__version__,"mediapipe_version":mp.__version__}
+
+
 def _child_entry(module_name: str,qualname: str):
     try:
         request=json.load(sys.stdin)
@@ -51,7 +66,6 @@ def _rss_bytes(pid: int) -> int:
     """Read child resident memory through psutil (Windows and POSIX)."""
     try:
         import psutil
-        return int(psutil.Process(pid).memory_info().rss)
     except ImportError:
         if os.name=="nt":
             result=subprocess.run(["tasklist","/FI",f"PID eq {pid}","/FO","CSV","/NH"],
@@ -65,6 +79,13 @@ def _rss_bytes(pid: int) -> int:
         with open(f"/proc/{pid}/statm",encoding="ascii") as stream:
             resident=int(stream.read().split()[1])
         return resident*os.sysconf("SC_PAGE_SIZE")
+    try:
+        return int(psutil.Process(pid).memory_info().rss)
+    except psutil.Error as exc:
+        # The child can exit after poll() but before psutil reads its RSS.
+        # Convert psutil's NoSuchProcess/ZombieProcess into the OSError that
+        # run_killable already treats as a normal child-exit race.
+        raise OSError("cannot query decoder process memory") from exc
 
 
 def run_killable(target, args: tuple, *, timeout_seconds: float, memory_limit_mb: int, poll_seconds: float=0.02):

@@ -27,7 +27,7 @@ class FeatureEnvelope(BaseModel):
     presence: Literal["present", "missing"]
     extraction_status: Literal["not_provided", "available", "insufficient_quality", "failed", "invalid_media"]
     quality: ModalityQuality
-    features: dict[str, float | int | bool | str | None | dict[str, str | int | float | bool]]
+    features: dict[str, float | int | bool | str | None | list[int] | dict[str, str | int | float | bool]]
     provenance: dict[str, str] = Field(default_factory=dict)
 
 
@@ -61,6 +61,8 @@ class AnalysisResult(BaseModel):
     model_version: None = None
     model_invocation_status: Literal["not_invoked_no_validated_model"] = "not_invoked_no_validated_model"
     targets: dict[Literal["reference_sleepiness", "vigilance_impairment"], TargetOutput]
+    measurements: dict[str, object] = Field(default_factory=dict)
+    behavioral_evidence: dict[str, object] | None = None
     prediction_extension: PredictionExtension
     subjective_reference: dict[str, str | int | bool] | None = None
     evidence: dict[str, object] | None = None

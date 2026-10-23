@@ -1,0 +1,352 @@
+{
+  "accepted": 16,
+  "benchmark": "wellar_v2_postgres_minio_real_http",
+  "cohorts": [
+    {
+      "accepted": 1,
+      "accepted_scans_per_second": 0.455,
+      "completed": 1,
+      "concurrency": 1,
+      "elapsed_seconds": 2.197,
+      "failed": 0,
+      "failed_scan_end_to_end_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "sample_count": 0
+      },
+      "failed_upload_request_latency_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "sample_count": 0
+      },
+      "failure_codes": {},
+      "queue_depth_trace": {
+        "max_oldest_queued_age_seconds": 0.0,
+        "max_queued": 0,
+        "max_running": 1,
+        "max_terminal_failures": 0,
+        "sample_count": 8,
+        "sample_interval_ms": 250
+      },
+      "queue_snapshot_after_cohort": {
+        "oldest_queued_age_seconds": null,
+        "queued": 0,
+        "retries": 0,
+        "running": 0,
+        "terminal_failures": 0
+      },
+      "repetition": 1,
+      "scan_attempts": 1,
+      "scan_submission_requests": 1,
+      "submit_to_result_visible_ms": {
+        "p50": 2004.722,
+        "p95": 2004.722,
+        "p99": 2004.722,
+        "sample_count": 1
+      },
+      "submit_to_terminal_ms": {
+        "p50": 1973.873,
+        "p95": 1973.873,
+        "p99": 1973.873,
+        "sample_count": 1
+      },
+      "throughput_scans_per_second": 0.455,
+      "timeouts": 0,
+      "upload_start_to_result_visible_ms": {
+        "p50": 2147.357,
+        "p95": 2147.357,
+        "p99": 2147.357,
+        "sample_count": 1
+      }
+    },
+    {
+      "accepted": 5,
+      "accepted_scans_per_second": 2.903,
+      "completed": 5,
+      "concurrency": 5,
+      "elapsed_seconds": 1.722,
+      "failed": 0,
+      "failed_scan_end_to_end_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "sample_count": 0
+      },
+      "failed_upload_request_latency_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "sample_count": 0
+      },
+      "failure_codes": {},
+      "queue_depth_trace": {
+        "max_oldest_queued_age_seconds": 0.266,
+        "max_queued": 2,
+        "max_running": 2,
+        "max_terminal_failures": 0,
+        "sample_count": 6,
+        "sample_interval_ms": 250
+      },
+      "queue_snapshot_after_cohort": {
+        "oldest_queued_age_seconds": null,
+        "queued": 0,
+        "retries": 0,
+        "running": 0,
+        "terminal_failures": 0
+      },
+      "repetition": 1,
+      "scan_attempts": 5,
+      "scan_submission_requests": 5,
+      "submit_to_result_visible_ms": {
+        "p50": 601.246,
+        "p95": 1353.029,
+        "p99": 1353.029,
+        "sample_count": 5
+      },
+      "submit_to_terminal_ms": {
+        "p50": 593.352,
+        "p95": 1341.878,
+        "p99": 1341.878,
+        "sample_count": 5
+      },
+      "throughput_scans_per_second": 2.903,
+      "timeouts": 0,
+      "upload_start_to_result_visible_ms": {
+        "p50": 1007.785,
+        "p95": 1641.662,
+        "p99": 1641.662,
+        "sample_count": 5
+      }
+    },
+    {
+      "accepted": 10,
+      "accepted_scans_per_second": 5.615,
+      "completed": 10,
+      "concurrency": 10,
+      "elapsed_seconds": 1.781,
+      "failed": 0,
+      "failed_scan_end_to_end_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "sample_count": 0
+      },
+      "failed_upload_request_latency_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "sample_count": 0
+      },
+      "failure_codes": {},
+      "queue_depth_trace": {
+        "max_oldest_queued_age_seconds": 0.171,
+        "max_queued": 1,
+        "max_running": 2,
+        "max_terminal_failures": 0,
+        "sample_count": 5,
+        "sample_interval_ms": 250
+      },
+      "queue_snapshot_after_cohort": {
+        "oldest_queued_age_seconds": null,
+        "queued": 0,
+        "retries": 0,
+        "running": 0,
+        "terminal_failures": 0
+      },
+      "repetition": 1,
+      "scan_attempts": 10,
+      "scan_submission_requests": 10,
+      "submit_to_result_visible_ms": {
+        "p50": 618.424,
+        "p95": 764.328,
+        "p99": 764.328,
+        "sample_count": 10
+      },
+      "submit_to_terminal_ms": {
+        "p50": 530.636,
+        "p95": 686.985,
+        "p99": 686.985,
+        "sample_count": 10
+      },
+      "throughput_scans_per_second": 5.615,
+      "timeouts": 0,
+      "upload_start_to_result_visible_ms": {
+        "p50": 1294.285,
+        "p95": 1538.301,
+        "p99": 1538.301,
+        "sample_count": 10
+      }
+    }
+  ],
+  "completed": 16,
+  "concurrent_idempotency": {
+    "accepted": 0,
+    "created": 0,
+    "distinct_scan_ids": 0,
+    "requests": 0,
+    "skipped": true
+  },
+  "configuration": {
+    "cohorts": [
+      1,
+      5,
+      10
+    ],
+    "configured_upload_slots_from_env": 4,
+    "deadline_seconds": 90,
+    "idempotency_replay_skipped": true,
+    "media": [
+      "image/jpeg",
+      "video/mp4",
+      "audio/wav"
+    ],
+    "repetitions": 1,
+    "synthetic_fixture_bytes": {
+      "audio": 32044,
+      "image": 2359,
+      "video": 1575
+    },
+    "worker_count_reported_by_operator": 2,
+    "worker_scaling_performed_by_harness": false
+  },
+  "credential_free": true,
+  "duration_seconds": 7.244,
+  "endpoint_class": "fixed_loopback_sprint08_compose",
+  "failed": 0,
+  "failure_types": {},
+  "http_429_responses_by_endpoint_reason": {
+    "media_upload:image:upload_capacity_exceeded": 6
+  },
+  "http_429_responses_total": 6,
+  "http_requests_by_endpoint": {
+    "media_delete": 48,
+    "media_upload:audio": 16,
+    "media_upload:image": 22,
+    "media_upload:video": 16,
+    "readiness_queue_sample": 19,
+    "readiness_queue_snapshot": 3,
+    "result_retrieval": 16,
+    "scan_status_poll": 59,
+    "scan_submission": 16
+  },
+  "internet_used": false,
+  "latency_ms": {
+    "failed_scan_end_to_end": {
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "sample_count": 0
+    },
+    "failed_submit_request": {
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "sample_count": 0
+    },
+    "failed_upload_request": {
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "sample_count": 0
+    },
+    "requests": {
+      "cleanup": {
+        "p50": 76.462,
+        "p95": 144.631,
+        "p99": 155.436,
+        "sample_count": 48
+      },
+      "poll": {
+        "p50": 12.248,
+        "p95": 162.234,
+        "p99": 244.879,
+        "sample_count": 59
+      },
+      "queue_sampler": {
+        "p50": 24.232,
+        "p95": 250.788,
+        "p99": 250.788,
+        "sample_count": 19
+      },
+      "result_get": {
+        "p50": 56.903,
+        "p95": 152.352,
+        "p99": 152.352,
+        "sample_count": 16
+      },
+      "submit": {
+        "p50": 214.84,
+        "p95": 379.714,
+        "p99": 379.714,
+        "sample_count": 16
+      },
+      "upload_audio": {
+        "p50": 160.323,
+        "p95": 277.102,
+        "p99": 277.102,
+        "sample_count": 16
+      },
+      "upload_image": {
+        "p50": 129.664,
+        "p95": 227.542,
+        "p99": 244.498,
+        "sample_count": 22
+      },
+      "upload_video": {
+        "p50": 148.31,
+        "p95": 222.185,
+        "p99": 222.185,
+        "sample_count": 16
+      }
+    },
+    "successful_submit_to_result_visible": {
+      "p50": 618.424,
+      "p95": 2004.722,
+      "p99": 2004.722,
+      "sample_count": 16
+    },
+    "successful_submit_to_terminal": {
+      "p50": 583.657,
+      "p95": 1973.873,
+      "p99": 1973.873,
+      "sample_count": 16
+    },
+    "successful_upload_start_to_result_visible": {
+      "p50": 1291.216,
+      "p95": 2147.357,
+      "p99": 2147.357,
+      "sample_count": 16
+    }
+  },
+  "limitations": [
+    "single host and local Compose stack only",
+    "no inference or scientific validity claim",
+    "queue snapshots are sampled after each cohort",
+    "container resource telemetry is not collected by this HTTP harness",
+    "a server-side object whose upload response was lost has no safe client-visible media_ref and is left to retention/operator reconciliation"
+  ],
+  "machine": {
+    "architecture": "AMD64",
+    "cpu": "Intel64 Family 6 Model 158 Stepping 9, GenuineIntel",
+    "logical_processors": 8,
+    "os": "Windows-10-10.0.26100-SP0"
+  },
+  "media_cleanup": {
+    "assets_retained_for_unresolved_scans": 0,
+    "delete_failures": 0,
+    "unknown_refs_after_ambiguous_upload_failure": true
+  },
+  "retry_429_count": 6,
+  "run_finished_at_utc": "2026-10-20T12:02:27.031137+00:00",
+  "run_started_at_utc": "2026-10-20T12:02:19.786345+00:00",
+  "scan_attempts": 16,
+  "scan_submission_requests": 16,
+  "synthetic_only": true,
+  "timeouts": 0,
+  "worker_events": {
+    "available": false,
+    "reason": "container_logs_unavailable"
+  }
+}

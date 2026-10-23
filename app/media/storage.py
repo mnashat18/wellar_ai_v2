@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from app.core.errors import WellarError
 from app.core.logging import event
+from app.media.deletion_process import run_bounded_storage_action
 from app.observability.metrics import worker_metrics
 
 logger=logging.getLogger("wellar.media.intake")
@@ -37,7 +38,7 @@ def _signature_ok(modality: str, content_type: str, head: bytes) -> bool:
 
 class LocalMediaStore:
     """Single-host development object store. References disclose no filesystem path."""
-    def __init__(self, root: str, queue_store, caps: dict[str,int], max_total_bytes:int=1024*1024*1024,max_tenant_bytes:int=100*1024*1024,max_concurrent_uploads:int=4):
+    def __init__(self, root: str, queue_store, caps: dict[str,int], max_total_bytes:int=1024*1024*1024,max_tenant_bytes:int=100*1024*1024,max_concurrent_uploads:int=4,delete_timeout_seconds:float=5.0,scratch_sweep_max_entries:int=100):
         self.root=Path(root).resolve()
         self.root.mkdir(parents=True,exist_ok=True)
         try: os.chmod(self.root,0o700)
@@ -46,6 +47,8 @@ class LocalMediaStore:
         self.caps=caps
         self.max_total_bytes=max_total_bytes; self.max_tenant_bytes=max_tenant_bytes
         self._upload_slots=threading.BoundedSemaphore(max_concurrent_uploads)
+        self.delete_timeout_seconds=float(delete_timeout_seconds)
+        self.scratch_sweep_max_entries=max(1,min(int(scratch_sweep_max_entries),1000))
 
     def _tenant_dir(self, tenant_id: str) -> tuple[str,Path]:
         tenant_hash=hashlib.sha256(tenant_id.encode()).hexdigest()[:24]
@@ -137,11 +140,26 @@ class LocalMediaStore:
     def delete(self,reference: str,tenant_id: str,subject_id: str)->bool:
         item=self.queue_store.get_media_by_ref(reference,tenant_id,subject_id)
         if not item:return False
-        path=self.root/item["relative_path"]
-        path.unlink(missing_ok=True)
+        self._delete_storage_item(item)
         record=self.queue_store.delete_media_record(item["media_id"],tenant_id,subject_id)
         if record:worker_metrics.increment("storage","deleted")
         return bool(record)
+
+    def delete_for_reconciliation(self,reference: str,tenant_id: str,subject_id: str,*,timeout_seconds:float|None=None)->bool:
+        """Delete bytes only; the queue store performs lease-fenced metadata cleanup."""
+        item=self.queue_store.get_media_by_ref(reference,tenant_id,subject_id)
+        if not item:return False
+        self._delete_storage_item(item,timeout_seconds)
+        return True
+
+    def _delete_storage_item(self,item:dict,timeout_seconds:float|None=None)->None:
+        candidate=self.root/item["relative_path"]
+        parent=candidate.parent.resolve()
+        if self.root not in parent.parents:raise OSError("media path is outside storage root")
+        if not candidate.is_symlink() and candidate.exists() and self.root not in candidate.resolve().parents:
+            raise OSError("media path is outside storage root")
+        operation_timeout=self.delete_timeout_seconds if timeout_seconds is None else min(self.delete_timeout_seconds,float(timeout_seconds))
+        run_bounded_storage_action({"action":"unlink","path":str(candidate)},operation_timeout)
 
     def purge_expired(self,cutoff_epoch:float)->int:
         removed=0
@@ -151,14 +169,11 @@ class LocalMediaStore:
         return removed
 
     def sweep_stale_scratch(self,older_than_seconds:float=3600)->int:
-        cutoff=time.time()-max(60.0,float(older_than_seconds));removed=0
-        for path in self.root.rglob("*.partial"):
-            try:
-                if path.is_file() and path.stat().st_mtime<cutoff:
-                    path.unlink(missing_ok=True);removed+=1
-            except OSError:
-                worker_metrics.increment("storage","scratch_delete_failed")
-        return removed
+        cutoff=time.time()-max(60.0,float(older_than_seconds))
+        try:return int(run_bounded_storage_action({"action":"sweep_local","root":str(self.root),"cutoff":cutoff,"maximum":self.scratch_sweep_max_entries},self.delete_timeout_seconds).get("removed",0))
+        except Exception:
+            worker_metrics.increment("storage","scratch_delete_failed")
+            raise
 
     def close(self)->None: pass
 

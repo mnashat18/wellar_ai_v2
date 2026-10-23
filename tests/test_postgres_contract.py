@@ -32,3 +32,13 @@ def test_directus_sync_migration_is_additive_and_has_unique_tenant_binding_and_d
     assert "for update" in (Path(__file__).resolve().parents[1]/"app"/"queue"/"postgres_store.py").read_text().lower()
     assert "drop table if exists directus_scan_bindings" in down
     assert "drop column if exists delivery_status" in down
+
+
+def test_media_reconciliation_checkpoint_migration_is_additive():
+    root=Path(__file__).resolve().parents[1]/"deployment"/"migrations"
+    up=(root/"005_media_reconciliation_checkpoint.up.sql").read_text().lower()
+    down=(root/"005_media_reconciliation_checkpoint.down.sql").read_text().lower()
+    assert "create table media_reconciliation_state" in up
+    assert "cycle_started_at" in up and "after_scan_id" in up
+    assert "lease_owner" in up and "lease_until" in up
+    assert "drop table media_reconciliation_state" in down

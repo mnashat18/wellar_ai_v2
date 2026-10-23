@@ -2,8 +2,9 @@ from datetime import datetime,timezone,timedelta
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.exceptions import PyJWKClientConnectionError
 
-from app.security.auth import JWTAuthenticator
+from app.security.auth import AuthenticationProviderUnavailable, JWTAuthenticator
 
 
 class Key:
@@ -62,12 +63,18 @@ def test_oidc_rejects_not_yet_valid_future_issued_and_missing_expiry_tokens():
     assert verifier.authenticate(no_expiry) is None
 
 
-def test_oidc_rejects_unavailable_jwks_and_malformed_identity_claim_types():
+def test_oidc_classifies_jwks_transport_outage_as_provider_unavailable():
     trusted=rsa.generate_private_key(public_exponent=65537,key_size=2048)
     class UnavailableJwks:
-        def get_signing_key_from_jwt(self,token): raise RuntimeError("provider details must not escape")
+        def get_signing_key_from_jwt(self,token): raise PyJWKClientConnectionError("provider details must not escape")
     unavailable=JWTAuthenticator(issuer="issuer",audience="aud",jwks_uri="https://issuer/keys",jwks_client=UnavailableJwks())
-    assert unavailable.authenticate("not-a-jwt") is None
+    token=jwt.encode({"iss":"issuer","aud":"aud","sub":"subject","tenant_id":"tenant","exp":9999999999,"iat":1},trusted,algorithm="RS256",headers={"kid":"test"})
+    with pytest.raises(AuthenticationProviderUnavailable):
+        unavailable.authenticate(token)
+
+
+def test_oidc_rejects_malformed_identity_claim_types():
+    trusted=rsa.generate_private_key(public_exponent=65537,key_size=2048)
     now=datetime.now(timezone.utc)
     verifier=JWTAuthenticator(issuer="issuer",audience="aud",jwks_uri="https://issuer/keys",jwks_client=LocalJwks(trusted.public_key()))
     for claim,value in (("sub",["subject"]),("tenant_id",{"tenant":"tenant"}),("tenant_id","")):

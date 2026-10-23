@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2
 COPY requirements-lock.txt .
 RUN pip install --no-cache-dir -r requirements-lock.txt && groupadd --system wellar && useradd --system --gid wellar --create-home wellar && mkdir -p /var/lib/wellar && chown -R wellar:wellar /var/lib/wellar /srv/wellar
 COPY --chown=wellar:wellar app app
+COPY --chown=wellar:wellar config config
 COPY --chown=wellar:wellar deployment/migrations deployment/migrations
 USER wellar
 EXPOSE 8000

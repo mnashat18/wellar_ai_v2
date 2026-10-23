@@ -31,7 +31,7 @@ class _ResearchClassifier:
         return {"name": "test-fixture-only", "deployment_scope": "research-only non-production"}
 
 
-def test_worker_research_result_is_separate_from_operational_targets(monkeypatch):
+def test_stage_one_never_invokes_research_image_classifier(monkeypatch):
     import app.media.analysis as analysis
 
     # The processor delegates decoding to a separate killable process. Stub
@@ -55,11 +55,9 @@ def test_worker_research_result_is_separate_from_operational_targets(monkeypatch
         "_worker_context": {"scan_id": "test", "tenant_id": "tenant", "subject_id": "subject"},
     })
     try:
-        assert classifier.calls == 1
-        research = result["evidence"]["research_model_inference"]
-        assert research["scope"] == "non_production_research_only"
-        assert research["results"][0]["status"] == "research_only"
-        assert research["results"][0]["calibrated"] is False
+        assert classifier.calls == 0
+        assert "research_model_inference" not in result["evidence"]
+        assert result["drowsiness_indicator"]["status"] == "not_performed"
         assert result["prediction_extension"]["targets"]["reference_sleepiness"]["status"] == "unavailable"
         assert result["prediction_extension"]["targets"]["subjective_fatigue"]["status"] == "unavailable"
         assert result["prediction_extension"]["targets"]["vigilance_impairment"]["status"] == "unavailable"

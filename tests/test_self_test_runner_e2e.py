@@ -106,7 +106,7 @@ def test_disposable_runner_real_http_worker_extraction_and_cleanup():
         assert status == 201
         reference = uploaded["media_ref"]
         scan = {"schema_version": "1.0", "media_refs": [reference], "reaction_task": None,
-                "consent": {"media_processing": True, "research_use": True}}
+                "consent": {"media_processing": True, "consent_version": "operational-media-v1", "research_use": False}}
         status, accepted = _request(base_url + "/api/v1/scans", token, method="POST",
                                     body=json.dumps(scan).encode(), content_type="application/json",
                                     idempotency_key="local-self-test-once")

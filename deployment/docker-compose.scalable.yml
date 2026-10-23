@@ -1,0 +1,61 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment: &wellar-env
+      WELLAR_ENV: staging
+      WELLAR_QUEUE_BACKEND: postgres
+      WELLAR_WORKER_COUNT: ${WELLAR_WORKER_COUNT:-1}
+      WELLAR_POSTGRES_DSN: ${WELLAR_POSTGRES_DSN:?set a TLS-verified staging PostgreSQL DSN with sslmode=verify-full}
+      WELLAR_POSTGRES_AUTO_MIGRATE: "false"
+      WELLAR_POSTGRES_POOL_MIN: ${WELLAR_POSTGRES_POOL_MIN:-2}
+      WELLAR_POSTGRES_POOL_MAX: ${WELLAR_POSTGRES_POOL_MAX:-10}
+      WELLAR_POSTGRES_POOL_TIMEOUT: ${WELLAR_POSTGRES_POOL_TIMEOUT:-5}
+      WELLAR_POSTGRES_CONNECT_TIMEOUT: ${WELLAR_POSTGRES_CONNECT_TIMEOUT:-5}
+      WELLAR_POSTGRES_STATEMENT_TIMEOUT_MS: ${WELLAR_POSTGRES_STATEMENT_TIMEOUT_MS:-5000}
+      WELLAR_MEDIA_BACKEND: s3
+      WELLAR_S3_BUCKET: ${WELLAR_S3_BUCKET:?set a private staging bucket}
+      WELLAR_S3_REGION: ${WELLAR_S3_REGION:?set the bucket region}
+      WELLAR_S3_ENDPOINT_URL: ${WELLAR_S3_ENDPOINT_URL:-}
+      WELLAR_AUTH_MODE: oidc
+      WELLAR_OIDC_ISSUER: ${WELLAR_OIDC_ISSUER:?set the staging issuer}
+      WELLAR_OIDC_AUDIENCE: ${WELLAR_OIDC_AUDIENCE:?set the API audience}
+      WELLAR_OIDC_JWKS_URI: ${WELLAR_OIDC_JWKS_URI:?set the issuer JWKS URI}
+      WELLAR_OIDC_TENANT_CLAIM: ${WELLAR_OIDC_TENANT_CLAIM:-tenant_id}
+      WELLAR_OIDC_ALGORITHMS: ${WELLAR_OIDC_ALGORITHMS:-RS256}
+      WELLAR_LOG_LEVEL: ${WELLAR_LOG_LEVEL:-INFO}
+    ports: ["${WELLAR_API_PORT:-8000}:8000"]
+    restart: unless-stopped
+    command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000"]
+    healthcheck:
+      test: ["CMD","python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready',timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: ${WELLAR_API_CPU_LIMIT:?set WELLAR_API_CPU_LIMIT after capacity testing}
+          memory: ${WELLAR_API_MEMORY_LIMIT:?set WELLAR_API_MEMORY_LIMIT after capacity testing}
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment: *wellar-env
+    restart: unless-stopped
+    command: ["python","-m","app.workers.entrypoint"]
+    init: true
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD","python","-c","import os,pathlib,sys;me=str(os.getpid());alive=any(p.name!=me and b'app.workers.entrypoint' in p.read_bytes() for p in pathlib.Path('/proc').glob('[0-9]*/cmdline'));ready=any(pathlib.Path('/tmp').glob('wellar-worker-ready-*'));sys.exit(0 if alive and ready else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+    deploy:
+      replicas: ${WELLAR_WORKER_COUNT:-1}
+      resources:
+        limits:
+          cpus: ${WELLAR_WORKER_CPU_LIMIT:?set WELLAR_WORKER_CPU_LIMIT after capacity testing}
+          memory: ${WELLAR_WORKER_MEMORY_LIMIT:?set WELLAR_WORKER_MEMORY_LIMIT after capacity testing}

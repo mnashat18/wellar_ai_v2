@@ -9,7 +9,7 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-FEATURE_MAPPING_VERSION = "1.1"
+FEATURE_MAPPING_VERSION = "1.2"
 
 # `reaction_task` is intentionally unsupported: current reaction timestamps are
 # client-reported and are not trusted measurements of objective vigilance.
@@ -44,6 +44,10 @@ SUPPORTED_FEATURES = frozenset({
     "audio.ac_rms_dbfs",
     "audio.silence_window_fraction",
     "audio.clipped_sample_fraction",
+    "audio.voice_activity_window_fraction",
+    "audio.speech_like_window_fraction",
+    "audio.voice_activity_spectral_centroid_iqr_hz",
+    "audio.voice_activity_active_rms_coefficient_of_variation",
 })
 
 

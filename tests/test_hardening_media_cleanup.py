@@ -31,21 +31,21 @@ def processor(store):
     )
 
 
-def test_resolve_exception_attempts_owned_media_deletion():
+def test_resolve_exception_preserves_media_for_worker_retry():
     store = ResolveFailureStore()
     with pytest.raises(OSError, match="synthetic resolve failure"):
         processor(store)({
             "media_refs": ["media://tenant/ref"],
             "_worker_context": {"scan_id": "scan-test", "tenant_id": "tenant", "subject_id": "subject"},
         })
-    assert store.delete_calls == [("media://tenant/ref", "tenant", "subject")]
+    assert store.delete_calls == []
 
 
-def test_resolve_and_delete_failure_is_surfaced_without_reference_data():
+def test_resolve_exception_does_not_delete_even_when_storage_cleanup_would_fail():
     store = ResolveFailureStore(delete_error=OSError("synthetic delete failure"))
-    with pytest.raises(RuntimeError, match="scan media deletion failed"):
+    with pytest.raises(OSError, match="synthetic resolve failure"):
         processor(store)({
             "media_refs": ["media://tenant/ref"],
             "_worker_context": {"scan_id": "scan-test", "tenant_id": "tenant", "subject_id": "subject"},
         })
-    assert len(store.delete_calls) == 3
+    assert store.delete_calls == []

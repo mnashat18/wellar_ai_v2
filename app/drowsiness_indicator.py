@@ -107,7 +107,8 @@ def classify(measurements: dict, thresholds: dict | None = None, *, audio_qualit
     }
     failed = [reason for reason, passed in quality_checks.items() if not passed]
     base = {"schema_version": "1.1", "status": "insufficient_quality" if failed else "available",
-            "label": LABEL, "raw_measurements": raw, "thresholds_used": t,
+            "label": LABEL, "scope": "research_only_non_production", "production_prediction": False,
+            "raw_measurements": raw, "thresholds_used": t,
             "config_version": t["version"], "config_sha256": t["config_sha256"]}
     if failed:
         base["reason_code"] = failed[0]

@@ -25,6 +25,7 @@ class Settings:
     log_level: str = "INFO"
     db_path: str = "./data/wellar-v2-dev.sqlite3"
     queue_capacity: int = 1000
+    worker_count: int = 1
     max_attempts: int = 3
     lease_seconds: int = 30
     retry_base_seconds: float = 1.0
@@ -45,6 +46,20 @@ class Settings:
     max_media_per_tenant_bytes: int = 104857600
     media_retention_days: int = 30
     max_concurrent_uploads: int = 4
+    media_reconciliation_page_size: int = 50
+    media_reconciliation_max_pages: int = 5
+    media_reconciliation_max_references: int = 500
+    media_reconciliation_lease_seconds: int = 300
+    media_delete_connect_timeout_seconds: float = 2.0
+    media_delete_read_timeout_seconds: float = 3.0
+    media_delete_operation_timeout_seconds: float = 5.0
+    media_delete_retry_deadline_seconds: float = 16.0
+    media_delete_retry_attempts: int = 3
+    media_scratch_sweep_max_entries: int = 100
+    media_reconciliation_retry_initial_seconds: float = 1.0
+    media_reconciliation_retry_multiplier: float = 2.0
+    media_reconciliation_retry_max_seconds: float = 300.0
+    media_reconciliation_retry_jitter: float = 0.2
     queue_backend: str = "sqlite"
     postgres_dsn: str | None = None
     staging_postgres_ssl_disable_ack: bool = False
@@ -93,6 +108,7 @@ class Settings:
                 log_level=os.getenv("WELLAR_LOG_LEVEL", "INFO").upper(),
                 db_path=os.getenv("WELLAR_DB_PATH", "./data/wellar-v2-dev.sqlite3"),
                 queue_capacity=int(os.getenv("WELLAR_QUEUE_CAPACITY", "1000")),
+                worker_count=int(os.getenv("WELLAR_WORKER_COUNT", "1")),
                 max_attempts=int(os.getenv("WELLAR_MAX_ATTEMPTS", "3")),
                 lease_seconds=int(os.getenv("WELLAR_LEASE_SECONDS", "30")),
                 retry_base_seconds=float(os.getenv("WELLAR_RETRY_BASE_SECONDS", "1")),
@@ -113,6 +129,20 @@ class Settings:
                 max_media_per_tenant_bytes=int(os.getenv("WELLAR_MAX_MEDIA_PER_TENANT_BYTES",str(100*1024*1024))),
                 media_retention_days=int(os.getenv("WELLAR_MEDIA_RETENTION_DAYS","30")),
                 max_concurrent_uploads=int(os.getenv("WELLAR_MAX_CONCURRENT_UPLOADS", "4")),
+                media_reconciliation_page_size=int(os.getenv("WELLAR_MEDIA_RECONCILIATION_PAGE_SIZE","50")),
+                media_reconciliation_max_pages=int(os.getenv("WELLAR_MEDIA_RECONCILIATION_MAX_PAGES","5")),
+                media_reconciliation_max_references=int(os.getenv("WELLAR_MEDIA_RECONCILIATION_MAX_REFERENCES","500")),
+                media_reconciliation_lease_seconds=int(os.getenv("WELLAR_MEDIA_RECONCILIATION_LEASE_SECONDS","300")),
+                media_delete_connect_timeout_seconds=float(os.getenv("WELLAR_MEDIA_DELETE_CONNECT_TIMEOUT_SECONDS","2")),
+                media_delete_read_timeout_seconds=float(os.getenv("WELLAR_MEDIA_DELETE_READ_TIMEOUT_SECONDS","3")),
+                media_delete_operation_timeout_seconds=float(os.getenv("WELLAR_MEDIA_DELETE_OPERATION_TIMEOUT_SECONDS","5")),
+                media_delete_retry_deadline_seconds=float(os.getenv("WELLAR_MEDIA_DELETE_RETRY_DEADLINE_SECONDS","16")),
+                media_delete_retry_attempts=int(os.getenv("WELLAR_MEDIA_DELETE_RETRY_ATTEMPTS","3")),
+                media_scratch_sweep_max_entries=int(os.getenv("WELLAR_MEDIA_SCRATCH_SWEEP_MAX_ENTRIES","100")),
+                media_reconciliation_retry_initial_seconds=float(os.getenv("WELLAR_MEDIA_RECONCILIATION_RETRY_INITIAL_SECONDS","1")),
+                media_reconciliation_retry_multiplier=float(os.getenv("WELLAR_MEDIA_RECONCILIATION_RETRY_MULTIPLIER","2")),
+                media_reconciliation_retry_max_seconds=float(os.getenv("WELLAR_MEDIA_RECONCILIATION_RETRY_MAX_SECONDS","300")),
+                media_reconciliation_retry_jitter=float(os.getenv("WELLAR_MEDIA_RECONCILIATION_RETRY_JITTER","0.2")),
                 queue_backend=os.getenv("WELLAR_QUEUE_BACKEND","sqlite").lower(),
                 postgres_dsn=os.getenv("WELLAR_POSTGRES_DSN"),
                 staging_postgres_ssl_disable_ack=_env_bool("WELLAR_STAGING_POSTGRES_SSL_DISABLE_ACK", False),
@@ -147,10 +177,21 @@ class Settings:
             raise ValueError("WELLAR_ENV must be development, test, staging, or production")
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("WELLAR_LOG_LEVEL is invalid")
-        if min(self.queue_capacity, self.max_attempts, self.lease_seconds) < 1 or self.retry_base_seconds <= 0:
-            raise ValueError("queue capacity, attempts, lease and retry values must be positive")
+        if min(self.queue_capacity, self.worker_count, self.max_attempts, self.lease_seconds) < 1 or self.retry_base_seconds <= 0:
+            raise ValueError("queue capacity, worker count, attempts, lease and retry values must be positive")
         if min(self.max_video_bytes,self.max_image_bytes,self.max_audio_bytes,self.max_video_seconds,self.max_audio_seconds,self.max_image_pixels,self.max_video_frames,self.max_media_total_bytes,self.max_media_per_tenant_bytes,self.max_concurrent_uploads,self.media_retention_days) < 1 or self.video_sample_hz <= 0:
             raise ValueError("media limits and sample rate must be positive")
+        if not 1<=self.media_reconciliation_page_size<=5000 or not 1<=self.media_reconciliation_max_pages<=100 or not 1<=self.media_reconciliation_max_references<=100000 or not 1<=self.media_reconciliation_lease_seconds<=3600:
+            raise ValueError("media reconciliation page, work, and lease limits are invalid")
+        if (not 0.1<=self.media_delete_connect_timeout_seconds<=30 or not 0.1<=self.media_delete_read_timeout_seconds<=30
+            or not 0.1<=self.media_delete_operation_timeout_seconds<=60
+            or not self.media_delete_operation_timeout_seconds<=self.media_delete_retry_deadline_seconds<=300
+            or not 1<=self.media_delete_retry_attempts<=8 or not 1<=self.media_scratch_sweep_max_entries<=1000
+            or not 0.1<=self.media_reconciliation_retry_initial_seconds<=60
+            or not 1.1<=self.media_reconciliation_retry_multiplier<=10
+            or not self.media_reconciliation_retry_initial_seconds<=self.media_reconciliation_retry_max_seconds<=3600
+            or not 0<=self.media_reconciliation_retry_jitter<=0.5):
+            raise ValueError("media deletion deadlines or reconciliation backoff settings are invalid")
         if not 0.1<=self.decode_timeout_seconds<=120 or not 64<=self.decode_memory_limit_mb<=8192 or not 1<=self.worker_drain_seconds<=600:
             raise ValueError("decode deadline, memory cap, or worker drain setting is invalid")
         if self.environment not in {"development", "test"} and self.dev_auth_tokens:
@@ -162,6 +203,8 @@ class Settings:
         if not 1<=self.postgres_pool_min<=self.postgres_pool_max<=64 or min(self.postgres_connect_timeout,self.postgres_statement_timeout_ms)<1 or self.postgres_pool_timeout<=0:
             raise ValueError("PostgreSQL pool and timeout configuration is invalid")
         if self.queue_backend=="postgres" and not self.postgres_dsn: raise ValueError("WELLAR_POSTGRES_DSN is required for PostgreSQL")
+        if self.worker_count>1 and self.queue_backend!="postgres":
+            raise ValueError("multiple worker processes require PostgreSQL; SQLite is single-host development only")
         if self.media_backend=="s3" and not self.s3_bucket: raise ValueError("WELLAR_S3_BUCKET is required for S3-compatible storage")
         if self.model_inference_enabled and not self.model_artifact_dir:
             raise ValueError("WELLAR_MODEL_ARTIFACT_DIR is required when model inference is enabled")

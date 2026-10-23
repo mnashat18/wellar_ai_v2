@@ -42,9 +42,7 @@ def create_app(settings: Settings | None=None, store=None, authenticator=None) -
             raise RuntimeError("storage readiness check failed")
         app.state.media_store=create_media_store(settings,app.state.store)
         from app.media.analysis import MultimodalFeatureProcessor
-        from app.ml.registry import load_predictors
-        predictors=load_predictors(enabled=settings.model_inference_enabled,artifact_dir=settings.model_artifact_dir)
-        delegate=MultimodalFeatureProcessor(app.state.media_store,max_video_seconds=settings.max_video_seconds,max_audio_seconds=settings.max_audio_seconds,max_image_pixels=settings.max_image_pixels,max_video_frames=settings.max_video_frames,video_sample_hz=settings.video_sample_hz,decode_timeout_seconds=settings.decode_timeout_seconds,decode_memory_limit_mb=settings.decode_memory_limit_mb,analysis_timeout_seconds=settings.worker_drain_seconds,predictors=predictors)
+        delegate=MultimodalFeatureProcessor(app.state.media_store,max_video_seconds=settings.max_video_seconds,max_audio_seconds=settings.max_audio_seconds,max_image_pixels=settings.max_image_pixels,max_video_frames=settings.max_video_frames,video_sample_hz=settings.video_sample_hz,decode_timeout_seconds=settings.decode_timeout_seconds,decode_memory_limit_mb=settings.decode_memory_limit_mb,analysis_timeout_seconds=settings.worker_drain_seconds)
         app.state.worker_processor=(DirectusPullProcessor(DirectusHTTPClient(settings.directus_url,settings.directus_service_token,timeout=settings.directus_timeout_seconds),app.state.media_store,delegate) if settings.directus_pull_enabled else delegate)
         app.state.ready=True
         event(logger,"application.started",processing_stage="startup")
@@ -52,7 +50,10 @@ def create_app(settings: Settings | None=None, store=None, authenticator=None) -
         finally:
             app.state.ready=False
             if getattr(app.state,"worker_processor",None) is not None: app.state.worker_processor.close()
-            if getattr(app.state,"media_store",None) is not None and hasattr(app.state.media_store,"close"): app.state.media_store.close()
+            if getattr(app.state,"media_store",None) is not None:
+                media_store=app.state.media_store
+                if hasattr(media_store,"aclose"): await media_store.aclose()
+                elif hasattr(media_store,"close"): media_store.close()
             if owns_store: app.state.store.close()
             event(logger,"application.stopped",processing_stage="shutdown")
 

@@ -26,6 +26,10 @@ def _crash():
     os._exit(17)
 
 
+def _identity(value):
+    return value
+
+
 def test_wall_timeout_kills_child_process():
     started=time.monotonic()
     with pytest.raises(DecodeTimeoutError):
@@ -36,6 +40,33 @@ def test_wall_timeout_kills_child_process():
 def test_crashed_child_returns_control_to_parent():
     with pytest.raises(DecodeChildError):
         run_killable(_crash,(),timeout_seconds=3,memory_limit_mb=512)
+
+
+def test_child_exit_during_rss_check_is_treated_as_normal_exit(monkeypatch):
+    import io
+    import json
+    import app.media.isolated_decode as isolated_decode
+
+    class NoSuchProcess(Exception): pass
+    class ExitedChild:
+        pid=123
+        returncode=0
+        stdin=io.StringIO()
+        stdout=io.StringIO(json.dumps({"status":"ok","result":"done"}))
+        def __init__(self):self.polls=0
+        def poll(self):
+            self.polls+=1
+            return None if self.polls==1 else 0
+        def kill(self):raise AssertionError("an exited child must not be killed")
+        def wait(self,timeout=None):return 0
+
+    class GoneProcess:
+        def __init__(self,pid):pass
+        def memory_info(self):raise NoSuchProcess("child exited")
+
+    monkeypatch.setitem(sys.modules,"psutil",SimpleNamespace(Process=GoneProcess,Error=NoSuchProcess))
+    monkeypatch.setattr(isolated_decode.subprocess,"Popen",lambda *args,**kwargs:ExitedChild())
+    assert run_killable(_identity,("ignored",),timeout_seconds=3,memory_limit_mb=512)=="done"
 
 
 def test_memory_limit_kills_child_process(monkeypatch):
@@ -81,6 +112,7 @@ def test_decode_timeout_releases_worker_lease_and_deletes_media(store,tmp_path,m
     monkeypatch.setattr("app.media.analysis.run_killable",lambda *args,**kwargs: (_ for _ in ()).throw(DecodeTimeoutError("synthetic timeout")))
     assert Worker(store,"timeout-worker",processor).run_once()
     assert store.db.execute("SELECT status FROM jobs WHERE scan_id='scan-timeout'").fetchone()[0]=="queued"
-    assert media.deleted
+    # Retryable decoder timeouts retain native media for the next attempt.
+    assert not media.deleted
     processor.close()
 

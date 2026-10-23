@@ -107,6 +107,14 @@ class SQLiteQueueStore:
           job_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
           request_id TEXT NOT NULL DEFAULT '-',
           UNIQUE(tenant_id, subject_id, idempotency_key));
+        CREATE TABLE IF NOT EXISTS media_reconciliation_state(
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+          cycle_started_at REAL,
+          after_scan_id TEXT,
+          after_reference TEXT,
+          lease_owner TEXT,
+          lease_until REAL);
+        INSERT OR IGNORE INTO media_reconciliation_state(singleton) VALUES(1);
         CREATE TABLE IF NOT EXISTS jobs(
           job_id TEXT PRIMARY KEY, scan_id TEXT NOT NULL UNIQUE REFERENCES scans(scan_id),
           status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL,
@@ -129,6 +137,9 @@ class SQLiteQueueStore:
           expires_at REAL, consented_at REAL NOT NULL DEFAULT 0,
           consent_text_version TEXT NOT NULL DEFAULT 'wellar-v2-training-consent-v1');
         """)
+        reconciliation_columns={row[1] for row in self.db.execute("PRAGMA table_info(media_reconciliation_state)")}
+        if "after_reference" not in reconciliation_columns:
+            self.db.execute("ALTER TABLE media_reconciliation_state ADD COLUMN after_reference TEXT")
         label_columns={row[1] for row in self.db.execute("PRAGMA table_info(training_labels)")}
         label_additions={"fatigue":"INTEGER","focus":"INTEGER","shift":"TEXT","time_of_day":"TEXT","expires_at":"REAL","consented_at":"REAL NOT NULL DEFAULT 0","consent_text_version":"TEXT NOT NULL DEFAULT 'wellar-v2-training-consent-v1'"}
         for name, declaration in label_additions.items():
@@ -202,19 +213,21 @@ class SQLiteQueueStore:
 
     @_db_operation("claim", transaction=True)
     def claim(self, worker_id: str, now: float | None = None):
-        now = now or time.time()
+        supplied_now=now
         with self._lock:
             self.db.execute("BEGIN IMMEDIATE")
             try:
+                now=supplied_now if supplied_now is not None else time.time()
+                terminal_at=time.time()
                 # A worker that died on its final attempt is terminal once its lease expires.
                 self.db.execute("UPDATE jobs SET status='failed',last_error='lease_expired_retry_exhausted',lease_until=NULL,worker_id=NULL WHERE status='running' AND lease_until<? AND attempts>=?", (now,self.max_attempts))
-                self.db.execute("UPDATE scans SET status='failed',updated_at=? WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='failed') AND status!='completed'", (now,))
+                self.db.execute("UPDATE scans SET status='failed',updated_at=? WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='failed') AND status IN ('queued','processing')", (terminal_at,))
                 self.db.execute("UPDATE jobs SET status='queued',worker_id=NULL,lease_until=NULL,available_at=? WHERE status='running' AND lease_until<? AND attempts<?", (now, now, self.max_attempts))
                 self.db.execute("UPDATE scans SET status='queued',updated_at=? WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='queued') AND status='processing'", (now,))
                 row = self.db.execute("SELECT * FROM jobs WHERE status='queued' AND available_at<=? AND attempts<? ORDER BY available_at,rowid LIMIT 1", (now,self.max_attempts)).fetchone()
                 if not row:
                     self.db.execute("UPDATE jobs SET status='failed',last_error='retry_exhausted' WHERE status='queued' AND attempts>=?", (self.max_attempts,))
-                    self.db.execute("UPDATE scans SET status='failed',updated_at=? WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='failed') AND status!='completed'", (now,))
+                    self.db.execute("UPDATE scans SET status='failed',updated_at=? WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='failed') AND status IN ('queued','processing')", (terminal_at,))
                     self.db.execute("COMMIT")
                     return None
                 fence = row["fencing_token"] + 1
@@ -277,15 +290,103 @@ class SQLiteQueueStore:
         return [dict(row) for row in rows if f"media://{hashlib.sha256(row['tenant_id'].encode()).hexdigest()[:24]}/{row['media_id']}" not in referenced]
 
     @_db_operation("list_terminal_scan_media_refs")
-    def list_terminal_scan_media_refs(self, limit: int = 500):
-        rows=self.db.execute("SELECT scan_id,tenant_id,subject_id,payload_json FROM scans WHERE status IN ('completed','failed','cancelled') ORDER BY updated_at LIMIT ?",(max(1,min(int(limit),5000)),)).fetchall()
-        refs=[]
-        for row in rows:
-            try: media_refs=json.loads(row["payload_json"]).get("media_refs",[])
-            except (ValueError,TypeError,AttributeError): media_refs=[]
-            if isinstance(media_refs,list):
-                refs.extend({"scan_id":row["scan_id"],"tenant_id":row["tenant_id"],"subject_id":row["subject_id"],"reference":ref} for ref in media_refs if isinstance(ref,str) and ref.startswith("media://"))
-        return refs
+    def list_terminal_scan_media_refs(self, limit: int = 500, after_scan_id: str | None = None,
+                                      after_reference: str | None = None, terminal_before: float | None = None):
+        rows=self.db.execute("""
+            SELECT s.scan_id,s.tenant_id,s.subject_id,media_ref.value AS reference
+            FROM scans AS s
+            JOIN json_each(
+                CASE WHEN json_valid(s.payload_json) THEN s.payload_json ELSE '{}' END,
+                '$.media_refs'
+            ) AS media_ref
+            WHERE s.status IN ('completed','failed','cancelled')
+              AND media_ref.type='text' AND substr(media_ref.value,1,8)='media://'
+              -- The cycle cutoff is exclusive: equal timestamps belong to the
+              -- next cycle because wall clocks cannot order events within one tick.
+              AND (? IS NULL OR s.updated_at < ?)
+              AND (? IS NULL OR s.scan_id > ? OR (s.scan_id=? AND media_ref.value>?))
+            ORDER BY s.scan_id,media_ref.value
+            LIMIT ?
+        """,(terminal_before,terminal_before,after_scan_id,after_scan_id,after_scan_id,after_reference or "",max(1,min(int(limit),5000)))).fetchall()
+        return [{"scan_id":row["scan_id"],"tenant_id":row["tenant_id"],"subject_id":row["subject_id"],"reference":row["reference"]} for row in rows]
+
+    @_db_operation("begin_media_reconciliation", transaction=True)
+    def begin_media_reconciliation(self, owner: str, lease_seconds: int=300):
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            now=time.time()
+            state=self.db.execute("SELECT cycle_started_at,after_scan_id,after_reference,lease_owner,lease_until FROM media_reconciliation_state WHERE singleton=1").fetchone()
+            if state["lease_owner"] and state["lease_until"] is not None and state["lease_until"]>now:
+                self.db.execute("COMMIT")
+                return None
+            cycle_started_at=state["cycle_started_at"] if state["cycle_started_at"] is not None else now
+            self.db.execute("UPDATE media_reconciliation_state SET cycle_started_at=?,lease_owner=?,lease_until=? WHERE singleton=1",(cycle_started_at,owner,now+max(1,int(lease_seconds))))
+            self.db.execute("COMMIT")
+            return {"cycle_started_at":cycle_started_at,"after_scan_id":state["after_scan_id"],"after_reference":state["after_reference"]}
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
+    @_db_operation("advance_media_reconciliation", transaction=True)
+    def advance_media_reconciliation(self, owner: str, after_scan_id: str, after_reference: str, lease_seconds: int=300) -> bool:
+        cursor=self.db.execute("UPDATE media_reconciliation_state SET after_scan_id=?,after_reference=?,lease_until=(julianday('now')-2440587.5)*86400.0+? WHERE singleton=1 AND lease_owner=? AND lease_until>(julianday('now')-2440587.5)*86400.0",(after_scan_id,after_reference,max(1,int(lease_seconds)),owner))
+        return cursor.rowcount==1
+
+    @_db_operation("renew_media_reconciliation", transaction=True)
+    def renew_media_reconciliation(self, owner: str, lease_seconds: int=300) -> bool:
+        cursor=self.db.execute("UPDATE media_reconciliation_state SET lease_until=(julianday('now')-2440587.5)*86400.0+? WHERE singleton=1 AND lease_owner=? AND lease_until>(julianday('now')-2440587.5)*86400.0",(max(1,int(lease_seconds)),owner))
+        return cursor.rowcount==1
+
+    @_db_operation("finish_media_reconciliation_cycle", transaction=True)
+    def finish_media_reconciliation_cycle(self, owner: str) -> bool:
+        cursor=self.db.execute("UPDATE media_reconciliation_state SET cycle_started_at=NULL,after_scan_id=NULL,after_reference=NULL,lease_owner=NULL,lease_until=NULL WHERE singleton=1 AND lease_owner=? AND lease_until>(julianday('now')-2440587.5)*86400.0",(owner,))
+        return cursor.rowcount==1
+
+    @_db_operation("release_media_reconciliation", transaction=True)
+    def release_media_reconciliation(self, owner: str) -> bool:
+        cursor=self.db.execute("UPDATE media_reconciliation_state SET lease_owner=NULL,lease_until=NULL WHERE singleton=1 AND lease_owner=?",(owner,))
+        return cursor.rowcount==1
+
+    @_db_operation("remove_terminal_scan_media_refs", transaction=True)
+    def remove_terminal_scan_media_refs(self, owner: str, scan_id: str, references: list[str]) -> int:
+        if not references:
+            return 0
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            lease=self.db.execute("SELECT lease_owner,lease_until FROM media_reconciliation_state WHERE singleton=1").fetchone()
+            if lease["lease_owner"]!=owner or lease["lease_until"] is None or lease["lease_until"]<=time.time():
+                raise RuntimeError("media reconciliation lease is no longer valid")
+            row=self.db.execute("SELECT payload_json,tenant_id,subject_id FROM scans WHERE scan_id=? AND status IN ('completed','failed','cancelled')",(scan_id,)).fetchone()
+            if not row:
+                self.db.execute("COMMIT")
+                return 0
+            try:
+                payload=json.loads(row["payload_json"])
+            except (ValueError,TypeError):
+                self.db.execute("COMMIT")
+                return 0
+            media_refs=payload.get("media_refs") if isinstance(payload,dict) else None
+            if not isinstance(media_refs,list):
+                self.db.execute("COMMIT")
+                return 0
+            removed=set(references)
+            remaining=[ref for ref in media_refs if ref not in removed]
+            count=len(media_refs)-len(remaining)
+            if count:
+                payload["media_refs"]=remaining
+                self.db.execute("UPDATE scans SET payload_json=? WHERE scan_id=? AND status IN ('completed','failed','cancelled')",(json.dumps(payload,separators=(",",":")),scan_id))
+                # Media metadata is deleted under the same live-lease transaction as
+                # the payload reference; a stale storage operation cannot write it.
+                for reference in removed:
+                    if isinstance(reference,str) and reference.startswith("media://"):
+                        media_id=reference.rsplit("/",1)[-1]
+                        self.db.execute("DELETE FROM media_assets WHERE media_id=? AND tenant_id=? AND subject_id=?",
+                                        (media_id,row["tenant_id"],row["subject_id"]))
+            self.db.execute("COMMIT")
+            return count
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
 
     @_db_operation("get_scan_owner")
     def get_scan_owner(self, scan_id: str) -> dict[str,str] | None:
@@ -294,10 +395,10 @@ class SQLiteQueueStore:
 
     @_db_operation("complete", transaction=True)
     def complete(self, job: dict, result: dict):
-        now=time.time()
         with self._lock:
             self.db.execute("BEGIN IMMEDIATE")
             try:
+                now=time.time()
                 current=self.db.execute("SELECT * FROM jobs WHERE job_id=?",(job["job_id"],)).fetchone()
                 if not current or current["status"]!="running" or current["fencing_token"]!=job["fencing_token"] or current["worker_id"]!=job["worker_id"] or current["lease_until"] < now:
                     raise RuntimeError("stale worker lease")
@@ -454,10 +555,11 @@ class SQLiteQueueStore:
 
     @_db_operation("fail", transaction=True)
     def fail(self, job: dict, error_code: str, now: float | None = None, *, force_terminal: bool=False):
-        now=now or time.time()
+        supplied_now=now
         with self._lock:
             self.db.execute("BEGIN IMMEDIATE")
             try:
+                now=supplied_now if supplied_now is not None else time.time()
                 row=self.db.execute("SELECT * FROM jobs WHERE job_id=?",(job["job_id"],)).fetchone()
                 if not row or row["status"]!="running" or row["fencing_token"]!=job["fencing_token"] or row["worker_id"]!=job["worker_id"] or row["lease_until"] < now:
                     raise RuntimeError("stale worker lease")
@@ -466,7 +568,8 @@ class SQLiteQueueStore:
                 else:
                     status="queued"; available=now+self.retry_base_seconds*(2**(row["attempts"]-1))
                 self.db.execute("UPDATE jobs SET status=?,available_at=?,lease_until=NULL,worker_id=NULL,last_error=? WHERE job_id=?",(status,available,error_code[:80],job["job_id"]))
-                self.db.execute("UPDATE scans SET status=?,updated_at=? WHERE scan_id=?",(status,now,job["scan_id"]))
+                updated_at=time.time() if status=="failed" else now
+                self.db.execute("UPDATE scans SET status=?,updated_at=? WHERE scan_id=?",(status,updated_at,job["scan_id"]))
                 if status=="failed":
                     self.db.execute("INSERT OR IGNORE INTO outbox(event_id,scan_id,event_type,payload_json,created_at,published_at,available_at) VALUES(?,?,?,?,?,NULL,?)",(new_id(),job["scan_id"],"scan.failed",json.dumps({"scan_id":job["scan_id"]}),now,now))
                 self.db.execute("COMMIT")

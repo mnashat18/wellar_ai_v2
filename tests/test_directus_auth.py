@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+import threading
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 import pytest
@@ -81,6 +83,35 @@ def test_directus_authenticates_opaque_session_and_checks_membership_each_reques
     assert query["fields"]==["id,user,business_profile,status"]
     assert query["filter[user][_eq]"]==["employee-1"]
     assert query["filter[status][_eq]"]==["active"]
+
+
+def test_concurrent_directus_requests_keep_identity_and_membership_isolated():
+    class ConcurrentOpener:
+        def __init__(self):
+            self.requests = []
+            self.lock = threading.Lock()
+
+        def open(self, request, timeout):
+            from urllib.parse import parse_qs, urlparse
+            parsed = urlparse(request.full_url)
+            token = request.get_header("Authorization").removeprefix("Bearer ")
+            with self.lock:
+                self.requests.append((token, parsed.path))
+            if parsed.path == "/users/me":
+                return FakeResponse({"data": {"id": token, "status": "active"}})
+            assert parsed.path == "/items/business_profile_members"
+            assert parse_qs(parsed.query)["filter[user][_eq]"] == [token]
+            return FakeResponse({"data": [{"user": token,
+                                            "business_profile": f"tenant-{token}",
+                                            "status": "active"}]})
+
+    opener = ConcurrentOpener()
+    auth = DirectusAuthenticator("https://directus.example", opener=opener)
+    tokens = [f"synthetic-user-{index}" for index in range(12)]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        principals = list(pool.map(auth.authenticate, tokens))
+    assert principals == [Principal(token, f"tenant-{token}") for token in tokens]
+    assert len(opener.requests) == 24
 
 
 def test_directus_rejects_inactive_user_mismatched_or_ambiguous_membership():

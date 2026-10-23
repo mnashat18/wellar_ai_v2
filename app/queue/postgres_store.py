@@ -50,9 +50,9 @@ class PostgresQueueStore:
             conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
             applied={row["version"] for row in conn.execute("SELECT version FROM schema_migrations").fetchall()}
             root=Path(__file__).resolve().parents[2]/"deployment"/"migrations"
-            for version in (1,2,3,4):
+            for version in (1,2,3,4,5):
                 if version not in applied:
-                    name={1:"initial",2:"directus_sync",3:"training_labels",4:"label_lifecycle"}[version]
+                    name={1:"initial",2:"directus_sync",3:"training_labels",4:"label_lifecycle",5:"media_reconciliation_checkpoint"}[version]
                     conn.execute((root/f"{version:03d}_{name}.up.sql").read_text(encoding="utf-8"))
                     conn.execute("INSERT INTO schema_migrations(version) VALUES(%s)",(version,))
 
@@ -60,7 +60,7 @@ class PostgresQueueStore:
         with self.pool.connection() as conn,conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(728193441)")
             if conn.execute("SELECT to_regclass('schema_migrations') AS table_name").fetchone()["table_name"] is None:return
-            for version,name in ((4,"label_lifecycle"),(3,"training_labels"),(2,"directus_sync"),(1,"initial")):
+            for version,name in ((5,"media_reconciliation_checkpoint"),(4,"label_lifecycle"),(3,"training_labels"),(2,"directus_sync"),(1,"initial")):
                 if conn.execute("SELECT 1 FROM schema_migrations WHERE version=%s",(version,)).fetchone():
                     root=Path(__file__).resolve().parents[2]/"deployment"/"migrations"
                     conn.execute((root/f"{version:03d}_{name}.down.sql").read_text(encoding="utf-8"))
@@ -90,8 +90,12 @@ class PostgresQueueStore:
         started=time.perf_counter()
         instant=datetime.fromtimestamp(now,timezone.utc) if now is not None else datetime.now(timezone.utc)
         with self.pool.connection() as conn, conn.transaction():
+            # Serialize terminal transitions against reconciliation-cycle snapshots.
+            terminal_work=conn.execute("SELECT 1 FROM jobs WHERE (status='running' AND lease_until < %s AND attempts >= %s) OR (status='queued' AND attempts >= %s) LIMIT 1",(instant,self.max_attempts,self.max_attempts)).fetchone()
+            if terminal_work:
+                conn.execute("SELECT singleton FROM media_reconciliation_state WHERE singleton=TRUE FOR SHARE")
             conn.execute("UPDATE jobs SET status='failed',last_error='lease_expired_retry_exhausted',lease_until=NULL,worker_id=NULL WHERE status='running' AND lease_until < %s AND attempts >= %s",(instant,self.max_attempts))
-            conn.execute("UPDATE scans SET status='failed',updated_at=%s WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='failed') AND status!='completed'",(instant,))
+            conn.execute("UPDATE scans AS s SET status='failed',updated_at=clock_timestamp() WHERE s.scan_id IN (SELECT scan_id FROM jobs WHERE status='failed') AND s.status IN ('queued','processing')")
             conn.execute("UPDATE jobs SET status='queued',worker_id=NULL,lease_until=NULL,available_at=%s WHERE status='running' AND lease_until < %s AND attempts < %s",(instant,instant,self.max_attempts))
             conn.execute("UPDATE scans SET status='queued',updated_at=%s WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='queued') AND status='processing'",(instant,))
             row=conn.execute("SELECT * FROM jobs WHERE status='queued' AND available_at<=%s AND attempts<%s ORDER BY available_at LIMIT 1 FOR UPDATE SKIP LOCKED",(instant,self.max_attempts)).fetchone()
@@ -119,7 +123,8 @@ class PostgresQueueStore:
             scan=conn.execute("SELECT tenant_id,subject_id FROM scans WHERE scan_id=%s",(job["scan_id"],)).fetchone()
             conn.execute("INSERT INTO results(scan_id,tenant_id,subject_id,result_json) VALUES(%s,%s,%s,%s::jsonb) ON CONFLICT(scan_id) DO NOTHING",(job["scan_id"],scan["tenant_id"],scan["subject_id"],json.dumps(result,sort_keys=True)))
             conn.execute("UPDATE jobs SET status='completed',lease_until=NULL WHERE job_id=%s",(job["job_id"],))
-            conn.execute("UPDATE scans SET status='completed',updated_at=now() WHERE scan_id=%s",(job["scan_id"],))
+            conn.execute("SELECT singleton FROM media_reconciliation_state WHERE singleton=TRUE FOR SHARE")
+            conn.execute("UPDATE scans SET status='completed',updated_at=clock_timestamp() WHERE scan_id=%s",(job["scan_id"],))
             conn.execute("INSERT INTO outbox(event_id,scan_id,event_type,payload_json) VALUES(%s,%s,'scan.completed',%s::jsonb) ON CONFLICT(scan_id,event_type) DO NOTHING",(new_id(),job["scan_id"],json.dumps({"scan_id":job["scan_id"]})))
         event(logger,"queue.postgres.completed",processing_stage="queue_commit",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=job["worker_id"],duration_ms=round((time.perf_counter()-started)*1000,3))
         worker_metrics.increment("queue","completed")
@@ -213,8 +218,13 @@ class PostgresQueueStore:
             terminal=force_terminal or row["attempts"]>=self.max_attempts
             status="failed" if terminal else "queued"
             available=instant+timedelta(seconds=self.retry_base_seconds*(2**max(0,row["attempts"]-1)))
+            if terminal:
+                conn.execute("SELECT singleton FROM media_reconciliation_state WHERE singleton=TRUE FOR SHARE")
             conn.execute("UPDATE jobs SET status=%s,available_at=%s,lease_until=NULL,worker_id=NULL,last_error=%s WHERE job_id=%s",(status,available,error_code[:80],job["job_id"]))
-            conn.execute("UPDATE scans SET status=%s,updated_at=%s WHERE scan_id=%s",(status,instant,job["scan_id"]))
+            if terminal:
+                conn.execute("UPDATE scans SET status=%s,updated_at=clock_timestamp() WHERE scan_id=%s",(status,job["scan_id"]))
+            else:
+                conn.execute("UPDATE scans SET status=%s,updated_at=%s WHERE scan_id=%s",(status,instant,job["scan_id"]))
             if terminal:
                 conn.execute("INSERT INTO outbox(event_id,scan_id,event_type,payload_json) VALUES(%s,%s,'scan.failed',%s::jsonb) ON CONFLICT(scan_id,event_type) DO NOTHING",(new_id(),job["scan_id"],json.dumps({"scan_id":job["scan_id"]})))
         event(logger,"queue.postgres.retry_scheduled" if status=="queued" else "queue.postgres.terminal_failure",logging.WARNING if status=="queued" else logging.ERROR,processing_stage="queue_retry",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=job["worker_id"],duration_ms=round((time.perf_counter()-started)*1000,3),error_code=error_code[:80])
@@ -289,19 +299,86 @@ class PostgresQueueStore:
             referenced.update(payload.get("media_refs",[]))
         return [row for row in rows if f"media://{hashlib.sha256(row['tenant_id'].encode()).hexdigest()[:24]}/{row['media_id']}" not in referenced]
 
-    def list_terminal_scan_media_refs(self,limit=500):
+    def list_terminal_scan_media_refs(self,limit=500,after_scan_id=None,after_reference=None,terminal_before=None):
         with self.pool.connection() as conn:
-            rows=conn.execute("SELECT scan_id,tenant_id,subject_id,payload_json FROM scans WHERE status IN ('completed','failed','cancelled') ORDER BY updated_at LIMIT %s",(max(1,min(int(limit),5000)),)).fetchall()
-        refs=[]
-        for row in rows:
+            rows=conn.execute("""
+                SELECT s.scan_id,s.tenant_id,s.subject_id,media_ref.value #>> '{}' AS reference
+                FROM scans AS s
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    CASE WHEN jsonb_typeof(s.payload_json->'media_refs')='array'
+                         THEN s.payload_json->'media_refs' ELSE '[]'::jsonb END
+                ) AS media_ref(value)
+                WHERE s.status IN ('completed','failed','cancelled')
+                  AND (%s::text IS NULL OR (s.scan_id,media_ref.value #>> '{}') > (%s::text,%s::text))
+                  -- Exclusive cutoff: a tie is deferred because timestamp
+                  -- precision cannot prove whether terminalization preceded the snapshot.
+                  AND (%s::timestamptz IS NULL OR s.updated_at < %s::timestamptz)
+                  AND jsonb_typeof(media_ref.value)='string'
+                  AND left(media_ref.value #>> '{}',8)='media://'
+                ORDER BY s.scan_id,media_ref.value #>> '{}'
+                LIMIT %s
+            """,(after_scan_id,after_scan_id,after_reference or "",terminal_before,terminal_before,max(1,min(int(limit),5000)))).fetchall()
+        return [dict(row) for row in rows]
+
+    def begin_media_reconciliation(self,owner,lease_seconds=300):
+        with self.pool.connection() as conn,conn.transaction():
+            state=conn.execute("SELECT cycle_started_at,after_scan_id,after_reference,lease_owner,lease_until FROM media_reconciliation_state WHERE singleton=TRUE FOR UPDATE").fetchone()
+            now=conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+            if state["lease_owner"] and state["lease_until"] and state["lease_until"]>now:
+                return None
+            cycle_started_at=state["cycle_started_at"] or now
+            lease_until=now+timedelta(seconds=max(1,int(lease_seconds)))
+            conn.execute("UPDATE media_reconciliation_state SET cycle_started_at=%s,lease_owner=%s,lease_until=%s WHERE singleton=TRUE",(cycle_started_at,owner,lease_until))
+            return {"cycle_started_at":cycle_started_at,"after_scan_id":state["after_scan_id"],"after_reference":state["after_reference"]}
+
+    def renew_media_reconciliation(self,owner,lease_seconds=300):
+        with self.pool.connection() as conn,conn.transaction():
+            cur=conn.execute("UPDATE media_reconciliation_state SET lease_until=clock_timestamp()+(%s * interval '1 second') WHERE singleton=TRUE AND lease_owner=%s AND lease_until>clock_timestamp()",(max(1,int(lease_seconds)),owner))
+            return cur.rowcount==1
+
+    def advance_media_reconciliation(self,owner,after_scan_id,after_reference,lease_seconds=300):
+        with self.pool.connection() as conn,conn.transaction():
+            cur=conn.execute("UPDATE media_reconciliation_state SET after_scan_id=%s,after_reference=%s,lease_until=clock_timestamp()+(%s * interval '1 second') WHERE singleton=TRUE AND lease_owner=%s AND lease_until>clock_timestamp()",(after_scan_id,after_reference,max(1,int(lease_seconds)),owner))
+            return cur.rowcount==1
+
+    def finish_media_reconciliation_cycle(self,owner):
+        with self.pool.connection() as conn,conn.transaction():
+            cur=conn.execute("UPDATE media_reconciliation_state SET cycle_started_at=NULL,after_scan_id=NULL,after_reference=NULL,lease_owner=NULL,lease_until=NULL WHERE singleton=TRUE AND lease_owner=%s AND lease_until>clock_timestamp()",(owner,))
+            return cur.rowcount==1
+
+    def release_media_reconciliation(self,owner):
+        with self.pool.connection() as conn,conn.transaction():
+            cur=conn.execute("UPDATE media_reconciliation_state SET lease_owner=NULL,lease_until=NULL WHERE singleton=TRUE AND lease_owner=%s",(owner,))
+            return cur.rowcount==1
+
+    def remove_terminal_scan_media_refs(self,owner,scan_id,references):
+        if not references:return 0
+        with self.pool.connection() as conn,conn.transaction():
+            lease=conn.execute("SELECT lease_owner,lease_until FROM media_reconciliation_state WHERE singleton=TRUE FOR UPDATE").fetchone()
+            now=conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+            if lease["lease_owner"]!=owner or lease["lease_until"] is None or lease["lease_until"]<=now:
+                raise RuntimeError("media reconciliation lease is no longer valid")
+            row=conn.execute("SELECT payload_json,tenant_id,subject_id FROM scans WHERE scan_id=%s AND status IN ('completed','failed','cancelled') FOR UPDATE",(scan_id,)).fetchone()
+            if not row:return 0
             payload=row["payload_json"]
             if isinstance(payload,str):
-                try: payload=json.loads(payload)
-                except (ValueError,TypeError): payload={}
-            media_refs=payload.get("media_refs",[]) if isinstance(payload,dict) else []
-            if isinstance(media_refs,list):
-                refs.extend({"scan_id":row["scan_id"],"tenant_id":row["tenant_id"],"subject_id":row["subject_id"],"reference":ref} for ref in media_refs if isinstance(ref,str) and ref.startswith("media://"))
-        return refs
+                try:payload=json.loads(payload)
+                except (ValueError,TypeError):return 0
+            media_refs=payload.get("media_refs") if isinstance(payload,dict) else None
+            if not isinstance(media_refs,list):return 0
+            removed=set(references)
+            remaining=[ref for ref in media_refs if ref not in removed]
+            count=len(media_refs)-len(remaining)
+            if count:
+                payload["media_refs"]=remaining
+                conn.execute("UPDATE scans SET payload_json=%s::jsonb WHERE scan_id=%s AND status IN ('completed','failed','cancelled')",(json.dumps(payload,separators=(",",":")),scan_id))
+                # Keep media metadata removal in this owner-fenced transaction.
+                for reference in removed:
+                    if isinstance(reference,str) and reference.startswith("media://"):
+                        media_id=reference.rsplit("/",1)[-1]
+                        conn.execute("DELETE FROM media_assets WHERE media_id=%s AND tenant_id=%s AND subject_id=%s",
+                                     (media_id,row["tenant_id"],row["subject_id"]))
+            return count
 
     def get_scan_owner(self,scan_id):
         with self.pool.connection() as conn:return conn.execute("SELECT tenant_id,subject_id FROM scans WHERE scan_id=%s",(scan_id,)).fetchone()

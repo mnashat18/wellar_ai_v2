@@ -92,7 +92,7 @@ def _payload():
     }
 
 
-def test_worker_processor_invokes_guarded_json_backend_and_adds_versioned_targets(tmp_path, monkeypatch):
+def test_stage_one_does_not_invoke_even_an_injected_predictor(tmp_path, monkeypatch):
     # This hand-authored test artifact exists only to exercise code wiring; it is not a trained model.
     _test_release(tmp_path)
     predictors = load_predictors(enabled=True, artifact_dir=tmp_path)
@@ -102,13 +102,13 @@ def test_worker_processor_invokes_guarded_json_backend_and_adds_versioned_target
     extension = result["prediction_extension"]
     target = extension["targets"][TARGET]
     assert extension["schema_version"] == "1.0"
-    assert extension["inference_status"] == "partial"
-    assert target["status"] == "available"
-    assert target["value"] == 1
-    assert 0.0 <= target["confidence"] <= 1.0
-    assert target["model_version"] == "unit-test-only-fixture"
-    assert target["quality_status"] == "passed"
-    assert target["abstention_reason"] is None
+    assert extension["inference_status"] == "disabled"
+    assert target["status"] == "unavailable"
+    assert target["value"] is None
+    assert target["confidence"] is None
+    assert target["model_version"] is None
+    assert target["quality_status"] == "not_evaluated"
+    assert target["abstention_reason"] == "prediction_not_enabled"
     assert result["status"] == "insufficient_evidence"
     assert result["targets"]["reference_sleepiness"]["value"] is None
     assert result["targets"]["vigilance_impairment"]["value"] is None
@@ -166,18 +166,18 @@ def test_unsupported_feature_schema_is_rejected(tmp_path):
         load_predictors(enabled=True, artifact_dir=tmp_path)
 
 
-def test_quality_failure_abstains_without_emitting_a_value(tmp_path, monkeypatch):
+def test_quality_failure_keeps_stage_one_prediction_disabled(tmp_path, monkeypatch):
     _test_release(tmp_path)
     predictors = load_predictors(enabled=True, artifact_dir=tmp_path)
     result = _processor(predictors, monkeypatch, extraction_status="insufficient_quality")(_payload())
     target = result["prediction_extension"]["targets"][TARGET]
-    assert target["status"] == "abstained"
+    assert target["status"] == "unavailable"
     assert target["value"] is None and target["confidence"] is None
-    assert target["quality_status"] == "failed"
-    assert target["abstention_reason"] == "quality_failure"
+    assert target["quality_status"] == "not_evaluated"
+    assert target["abstention_reason"] == "prediction_not_enabled"
 
 
-def test_inference_exceptions_are_redacted_in_result_extension(monkeypatch):
+def test_injected_predictor_is_not_called_in_stage_one(monkeypatch):
     class FailingPredictor:
         feature_names = ("video.sampled_closed_fraction",)
 
@@ -187,6 +187,6 @@ def test_inference_exceptions_are_redacted_in_result_extension(monkeypatch):
     processor = _processor({TARGET: FailingPredictor()}, monkeypatch)
     result = processor(_payload())
     target = result["prediction_extension"]["targets"][TARGET]
-    assert target["status"] == "abstained"
-    assert target["abstention_reason"] == "inference_failed"
+    assert target["status"] == "unavailable"
+    assert target["abstention_reason"] == "prediction_not_enabled"
     assert "do-not-return" not in json.dumps(result)

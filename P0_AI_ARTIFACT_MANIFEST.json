@@ -1,0 +1,60 @@
+{
+  "schema_version": "wellar-p0-artifact-manifest/1.0",
+  "generated_utc": "2026-10-16",
+  "selected_research_artifact": {
+    "model_id": "mosesb/drowsiness-detection-mobileViT-v2",
+    "revision": "1aa87742178ae3a57b259d797b318bec696b02e1",
+    "path": "models/pretrained/mobilevitv2-drowsiness-1aa87742/best_model.pt",
+    "bytes": 69935051,
+    "sha256": "fcbe35c8e0c8149bed84189ab3cf0a06429107a968667a9f681ff113bed35867",
+    "source_url": "https://huggingface.co/mosesb/drowsiness-detection-mobileViT-v2/resolve/1aa87742178ae3a57b259d797b318bec696b02e1/best_model.pt",
+    "declared_license": "MIT",
+    "commercial_wellar_use_cleared": false,
+    "weights_loaded": true,
+    "real_inference_executed": true,
+    "scope": "research-only still-image driver-drowsiness binary output; never activates Wellar target predictions"
+  },
+  "comparison_artifacts": [
+    {
+      "model_id": "akahana/DOZE-GUARD-RLDD",
+      "revision": "29a292f79022050e09060f2987dcaa9cf9f278a9",
+      "path": "models/pretrained/doze-guard-rldd-29a292f7/model.safetensors",
+      "bytes": 371567992,
+      "sha256": "76dab6f2031a0ef0081ccf86b7d6c9b9c4a3f4d1a15f3eecb6019c1c99639a5b",
+      "declared_license": "Apache-2.0",
+      "commercial_wellar_use_cleared": false,
+      "loaded_and_executed": true,
+      "selection": "not selected; larger/slower and no independent participant-disjoint evidence; linked training-source license unclear"
+    },
+    {
+      "model_id": "notgoodkeeper/cnn-based-drowsiness-detection",
+      "artifact_bytes": 13463428,
+      "sha256": "82cdf13a674e2877a2e6adaaa5e6adf6ef0613a06568c4c4528f8aacc55bb9f4",
+      "declared_license": "MIT",
+      "acquired_or_loaded": false,
+      "selection": "rejected: drowsiness target labels derived from EAR/MAR/head-pose heuristics"
+    },
+    {
+      "model_id": "mosesb/drowsiness-detection-yolo-cls",
+      "artifact_bytes": 57006897,
+      "sha256": "4fed29ef7a18c011b440ce470554b2eb6c54fbb7c417b7ebf8245896f1a45032",
+      "declared_license": "MIT",
+      "acquired_or_loaded": false,
+      "selection": "rejected: reported metric lacked adequate independent split details and dataset rights verification"
+    },
+    {
+      "model_id": "Wellar PLOS KSS/PERCLOS research ridge v1",
+      "path": "research/kss_perclos_integration/models/wellar_kss_perclos_ridge_v1.json",
+      "sha256": "2eb1418edb305d9eca0e2f8fd159dc1092c3bdd4484b67c7be3e523fcbade85d",
+      "selection": "not used for mobile inference: five-minute pupil diameter PERCLOS schema incompatible with five-second RGB eye features"
+    }
+  ],
+  "verification": {
+    "selected_artifact_size_and_hash_verified_before_loading": true,
+    "checkpoint_loaded_with_torch_weights_only": true,
+    "tensor_state_dict_validated": true,
+    "architecture_state_loaded_strictly": true,
+    "private_pilot_training_or_evaluation": false,
+    "commercial_rights_for_wellar": false
+  }
+}

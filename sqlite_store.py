@@ -1,0 +1,464 @@
+from __future__ import annotations
+
+import json
+import hashlib
+import sqlite3
+import threading
+import time
+import logging
+import random
+from functools import wraps
+from pathlib import Path
+from typing import Any
+
+from app.core.errors import QueueFull
+from app.core.ids import new_id
+from app.core.logging import event
+
+logger = logging.getLogger("wellar.queue.sqlite")
+
+
+def sqlite_error_details(exc: sqlite3.Error) -> tuple[int | None, str | None, bool]:
+    """Classify lock errors without logging SQLite's potentially sensitive message."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    name = getattr(exc, "sqlite_errorname", None)
+    if code is not None:
+        return code, name, (code & 0xFF) in (5, 6)  # SQLITE_BUSY / SQLITE_LOCKED
+    # Python builds before sqlite_errorcode attributes: recognize only SQLite's
+    # fixed lock messages; arbitrary OperationalErrors remain permanent/unknown.
+    message = str(exc).strip().lower()
+    if isinstance(exc, sqlite3.OperationalError) and message in {
+        "database is locked", "database table is locked", "database schema is locked",
+    }:
+        return None, "SQLITE_LOCK_CONTENTION", True
+    return None, None, False
+
+
+def _db_operation(name: str, *, transaction: bool = False):
+    """Serialize use of this store's one SQLite connection and emit safe diagnostics."""
+    def decorate(method):
+        @wraps(method)
+        def wrapped(self, *args, **kwargs):
+            started = time.perf_counter()
+            with self._lock:
+                retries = 0
+                while True:
+                    try:
+                        result = method(self, *args, **kwargs)
+                        break
+                    except sqlite3.Error as exc:
+                        code, name_code, busy = sqlite_error_details(exc)
+                        if busy:
+                            self._busy_lock_count += 1
+                        if busy and transaction and retries < self.max_lock_retries:
+                            retries += 1
+                            self._sqlite_retry_count += 1
+                            delay = random.uniform(0.001, 0.01 * (2 ** retries))
+                            event(logger, "sqlite.operation.retry", logging.WARNING,
+                                  processing_stage="queue_storage", operation=name,
+                                  exception_type=type(exc).__name__, sqlite_error_code=code,
+                                  sqlite_error_name=name_code, retry_attempt_count=retries,
+                                  attempt_count=retries+1, busy_lock_count=self._busy_lock_count,
+                                  transaction_duration_ms=round((time.perf_counter()-started)*1000, 3))
+                            time.sleep(delay)
+                            continue
+                        event(logger, "sqlite.operation.failed", logging.WARNING,
+                              processing_stage="queue_storage", operation=name,
+                              exception_type=type(exc).__name__, sqlite_error_code=code,
+                              sqlite_error_name=name_code, retry_attempt_count=retries,
+                              attempt_count=retries+1,
+                              transaction_duration_ms=round((time.perf_counter()-started)*1000, 3),
+                              busy_lock_count=self._busy_lock_count)
+                        raise
+                if transaction:
+                    event(logger, "sqlite.transaction.completed", logging.INFO,
+                          processing_stage="queue_storage", operation=name,
+                          retry_attempt_count=retries, attempt_count=retries+1,
+                          transaction_duration_ms=round((time.perf_counter()-started)*1000, 3),
+                          busy_lock_count=self._busy_lock_count)
+                return result
+        return wrapped
+    return decorate
+
+
+class SQLiteQueueStore:
+    """Single-host local development queue. Never use for multi-host production."""
+    shared_monotonic_clock = True
+
+    def __init__(self, path: str, capacity: int = 1000, max_attempts: int = 3, lease_seconds: int = 30, retry_base_seconds: float = 1.0):
+        self.path, self.capacity, self.max_attempts = path, capacity, max_attempts
+        self.lease_seconds, self.retry_base_seconds = lease_seconds, retry_base_seconds
+        self._lock = threading.RLock()
+        self._busy_lock_count = 0
+        self._sqlite_retry_count = 0
+        self.max_lock_retries = 2
+        self.busy_timeout_ms = 2000
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=self.busy_timeout_ms/1000)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS scans(
+          scan_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, subject_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL,
+          job_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+          request_id TEXT NOT NULL DEFAULT '-',
+          UNIQUE(tenant_id, subject_id, idempotency_key));
+        CREATE TABLE IF NOT EXISTS jobs(
+          job_id TEXT PRIMARY KEY, scan_id TEXT NOT NULL UNIQUE REFERENCES scans(scan_id),
+          status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL,
+          lease_until REAL, fencing_token INTEGER NOT NULL DEFAULT 0, worker_id TEXT, last_error TEXT);
+        CREATE TABLE IF NOT EXISTS results(
+          scan_id TEXT PRIMARY KEY REFERENCES scans(scan_id), tenant_id TEXT NOT NULL,
+          subject_id TEXT NOT NULL, result_json TEXT NOT NULL, created_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS outbox(
+          event_id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, event_type TEXT NOT NULL,
+          payload_json TEXT NOT NULL, created_at REAL NOT NULL, published_at REAL,
+          UNIQUE(scan_id,event_type));
+        CREATE TABLE IF NOT EXISTS media_assets(
+          media_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, subject_id TEXT NOT NULL,
+          modality TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+          sha256 TEXT NOT NULL, relative_path TEXT NOT NULL, created_at REAL NOT NULL);
+        """)
+        outbox_columns={row[1] for row in self.db.execute("PRAGMA table_info(outbox)")}
+        additions={
+            "delivery_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "attempts": "INTEGER NOT NULL DEFAULT 0",
+            "available_at": "REAL NOT NULL DEFAULT 0",
+            "lease_until": "REAL",
+            "fencing_token": "INTEGER NOT NULL DEFAULT 0",
+            "publisher_id": "TEXT",
+            "last_error_code": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in outbox_columns:
+                self.db.execute(f"ALTER TABLE outbox ADD COLUMN {name} {declaration}")
+        self.db.execute("CREATE INDEX IF NOT EXISTS outbox_delivery_idx ON outbox(delivery_status,available_at,lease_until)")
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS scans_identity_unique ON scans(scan_id,tenant_id,subject_id)")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS directus_scan_bindings(
+          scan_id TEXT PRIMARY KEY, directus_scan_id TEXT NOT NULL UNIQUE,
+          tenant_id TEXT NOT NULL, subject_id TEXT NOT NULL, remote_owner_id TEXT NOT NULL,
+          remote_tenant_id TEXT NOT NULL, remote_scan_status TEXT NOT NULL,
+          membership_active INTEGER NOT NULL CHECK(membership_active=1),
+          media_owner_verified INTEGER NOT NULL CHECK(media_owner_verified=1),
+          verification_version TEXT NOT NULL, verified_at REAL NOT NULL,
+          FOREIGN KEY(scan_id,tenant_id,subject_id) REFERENCES scans(scan_id,tenant_id,subject_id))""")
+
+    @_db_operation("submit", transaction=True)
+    def submit(self, scan_id: str, principal, key: str, payload_hash: str, payload_json: str, request_id: str = "-"):
+        now = time.time()
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self.db.execute("SELECT * FROM scans WHERE tenant_id=? AND subject_id=? AND idempotency_key=?", (principal.tenant_id, principal.subject_id, key)).fetchone()
+                if existing:
+                    self.db.execute("COMMIT")
+                    return dict(existing), False
+                pending = self.db.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
+                if pending >= self.capacity:
+                    raise QueueFull()
+                job_id = new_id()
+                self.db.execute("INSERT INTO scans(scan_id,tenant_id,subject_id,idempotency_key,payload_hash,payload_json,job_id,status,created_at,updated_at,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (scan_id, principal.tenant_id, principal.subject_id, key, payload_hash, payload_json, job_id, "queued", now, now, request_id))
+                self.db.execute("INSERT INTO jobs(job_id,scan_id,status,available_at) VALUES(?,?,?,?)", (job_id, scan_id, "queued", now))
+                row = self.db.execute("SELECT * FROM scans WHERE scan_id=?", (scan_id,)).fetchone()
+                self.db.execute("COMMIT")
+                return dict(row), True
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    def _rollback_safely(self) -> None:
+        """Best-effort rollback which never masks the original transaction error."""
+        if self.db.in_transaction:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+
+    @_db_operation("claim", transaction=True)
+    def claim(self, worker_id: str, now: float | None = None):
+        now = now or time.time()
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                # A worker that died on its final attempt is terminal once its lease expires.
+                self.db.execute("UPDATE jobs SET status='failed',last_error='lease_expired_retry_exhausted',lease_until=NULL,worker_id=NULL WHERE status='running' AND lease_until<? AND attempts>=?", (now,self.max_attempts))
+                self.db.execute("UPDATE scans SET status='failed',updated_at=? WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='failed') AND status!='completed'", (now,))
+                self.db.execute("UPDATE jobs SET status='queued',worker_id=NULL,lease_until=NULL,available_at=? WHERE status='running' AND lease_until<? AND attempts<?", (now, now, self.max_attempts))
+                self.db.execute("UPDATE scans SET status='queued',updated_at=? WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='queued') AND status='processing'", (now,))
+                row = self.db.execute("SELECT * FROM jobs WHERE status='queued' AND available_at<=? AND attempts<? ORDER BY available_at,rowid LIMIT 1", (now,self.max_attempts)).fetchone()
+                if not row:
+                    self.db.execute("UPDATE jobs SET status='failed',last_error='retry_exhausted' WHERE status='queued' AND attempts>=?", (self.max_attempts,))
+                    self.db.execute("UPDATE scans SET status='failed',updated_at=? WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='failed') AND status!='completed'", (now,))
+                    self.db.execute("COMMIT")
+                    return None
+                fence = row["fencing_token"] + 1
+                self.db.execute("UPDATE jobs SET status='running',attempts=attempts+1,worker_id=?,lease_until=?,fencing_token=? WHERE job_id=?", (worker_id,now+self.lease_seconds,fence,row["job_id"]))
+                self.db.execute("UPDATE scans SET status='processing',updated_at=? WHERE scan_id=?", (now,row["scan_id"]))
+                job = dict(self.db.execute("SELECT * FROM jobs WHERE job_id=?",(row["job_id"],)).fetchone())
+                job["payload_json"] = self.db.execute("SELECT payload_json FROM scans WHERE scan_id=?",(row["scan_id"],)).fetchone()[0]
+                scan_meta=self.db.execute("SELECT request_id,created_at FROM scans WHERE scan_id=?",(row["scan_id"],)).fetchone()
+                job["request_id"] = scan_meta["request_id"]
+                job["created_at"] = scan_meta["created_at"]
+                owner=self.db.execute("SELECT tenant_id,subject_id FROM scans WHERE scan_id=?",(row["scan_id"],)).fetchone()
+                job["tenant_id"],job["subject_id"]=owner["tenant_id"],owner["subject_id"]
+                self.db.execute("COMMIT")
+                return job
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    @_db_operation("register_media", transaction=True)
+    def register_media(self, *, media_id: str, tenant_id: str, subject_id: str, modality: str,
+                       content_type: str, size_bytes: int, sha256: str, relative_path: str,
+                       max_total_bytes: int, max_tenant_bytes: int) -> None:
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                total=self.db.execute("SELECT COALESCE(SUM(size_bytes),0) FROM media_assets").fetchone()[0]
+                tenant=self.db.execute("SELECT COALESCE(SUM(size_bytes),0) FROM media_assets WHERE tenant_id=?",(tenant_id,)).fetchone()[0]
+                if total+size_bytes>max_total_bytes or tenant+size_bytes>max_tenant_bytes: raise ValueError("media storage quota exceeded")
+                self.db.execute("INSERT INTO media_assets VALUES(?,?,?,?,?,?,?,?,?)",(media_id,tenant_id,subject_id,modality,content_type,size_bytes,sha256,relative_path,time.time()))
+                self.db.execute("COMMIT")
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    @_db_operation("get_media_by_ref")
+    def get_media_by_ref(self, reference: str, tenant_id: str, subject_id: str) -> dict[str,Any] | None:
+        import hashlib
+        prefix="media://"+hashlib.sha256(tenant_id.encode()).hexdigest()[:24]+"/"
+        if not isinstance(reference,str) or not reference.startswith(prefix): return None
+        media_id=reference[len(prefix):]
+        row=self.db.execute("SELECT * FROM media_assets WHERE media_id=? AND tenant_id=? AND subject_id=?",(media_id,tenant_id,subject_id)).fetchone()
+        return dict(row) if row else None
+
+    @_db_operation("delete_media_record")
+    def delete_media_record(self, media_id: str, tenant_id: str, subject_id: str):
+        with self._lock:
+            row=self.db.execute("SELECT * FROM media_assets WHERE media_id=? AND tenant_id=? AND subject_id=?",(media_id,tenant_id,subject_id)).fetchone()
+            if not row:return None
+            self.db.execute("DELETE FROM media_assets WHERE media_id=? AND tenant_id=? AND subject_id=?",(media_id,tenant_id,subject_id))
+            return dict(row)
+
+    @_db_operation("list_expired_media")
+    def list_expired_media(self, cutoff_epoch: float):
+        rows=self.db.execute("SELECT * FROM media_assets WHERE created_at<?",(cutoff_epoch,)).fetchall()
+        active=self.db.execute("SELECT tenant_id,payload_json FROM scans WHERE status IN ('queued','processing')").fetchall()
+        referenced=set()
+        for scan in active:
+            try: referenced.update(json.loads(scan["payload_json"]).get("media_refs",[]))
+            except (ValueError,TypeError): continue
+        return [dict(row) for row in rows if f"media://{hashlib.sha256(row['tenant_id'].encode()).hexdigest()[:24]}/{row['media_id']}" not in referenced]
+
+    @_db_operation("get_scan_owner")
+    def get_scan_owner(self, scan_id: str) -> dict[str,str] | None:
+        row=self.db.execute("SELECT tenant_id,subject_id FROM scans WHERE scan_id=?",(scan_id,)).fetchone()
+        return dict(row) if row else None
+
+    @_db_operation("complete", transaction=True)
+    def complete(self, job: dict, result: dict):
+        now=time.time()
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                current=self.db.execute("SELECT * FROM jobs WHERE job_id=?",(job["job_id"],)).fetchone()
+                if not current or current["status"]!="running" or current["fencing_token"]!=job["fencing_token"] or current["worker_id"]!=job["worker_id"] or current["lease_until"] < now:
+                    raise RuntimeError("stale worker lease")
+                scan=self.db.execute("SELECT * FROM scans WHERE scan_id=?",(job["scan_id"],)).fetchone()
+                self.db.execute("INSERT OR IGNORE INTO results VALUES(?,?,?,?,?)",(job["scan_id"],scan["tenant_id"],scan["subject_id"],json.dumps(result,sort_keys=True),now))
+                self.db.execute("UPDATE jobs SET status='completed',lease_until=NULL WHERE job_id=?",(job["job_id"],))
+                self.db.execute("UPDATE scans SET status='completed',updated_at=? WHERE scan_id=?",(now,job["scan_id"]))
+                self.db.execute("INSERT OR IGNORE INTO outbox(event_id,scan_id,event_type,payload_json,created_at,published_at,available_at) VALUES(?,?,?,?,?,NULL,?)",(new_id(),job["scan_id"],"scan.completed",json.dumps({"scan_id":job["scan_id"]}),now,now))
+                self.db.execute("COMMIT")
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    @_db_operation("bind_directus_scan", transaction=True)
+    def bind_directus_scan(self, evidence) -> bool:
+        from app.integrations.directus_sync import DirectusBindingEvidence
+        if not isinstance(evidence,DirectusBindingEvidence): raise ValueError("verified Directus binding evidence is required")
+        evidence.validate()
+        scan_id,directus_scan_id,tenant_id,subject_id=evidence.scan_id,evidence.directus_scan_id,evidence.tenant_id,evidence.subject_id
+        now=evidence.verified_at
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                owner=self.db.execute("SELECT tenant_id,subject_id FROM scans WHERE scan_id=?",(scan_id,)).fetchone()
+                if not owner or owner["tenant_id"]!=tenant_id or owner["subject_id"]!=subject_id:
+                    raise ValueError("scan ownership does not match verified Directus identity")
+                old=self.db.execute("SELECT directus_scan_id,tenant_id,subject_id FROM directus_scan_bindings WHERE scan_id=?",(scan_id,)).fetchone()
+                if old:
+                    if tuple(old)==(directus_scan_id,tenant_id,subject_id):
+                        self.db.execute("COMMIT")
+                        return False
+                    raise ValueError("V2 scan already has a different Directus binding")
+                self.db.execute("INSERT INTO directus_scan_bindings(scan_id,directus_scan_id,tenant_id,subject_id,remote_owner_id,remote_tenant_id,remote_scan_status,membership_active,media_owner_verified,verification_version,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(scan_id,directus_scan_id,tenant_id,subject_id,evidence.remote_owner_id,evidence.remote_tenant_id,evidence.remote_status,1,1,"directus-binding-v1",now))
+                self.db.execute("COMMIT")
+                return True
+            except sqlite3.IntegrityError:
+                self._rollback_safely()
+                raise ValueError("Directus scan is already bound to another V2 scan") from None
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    @_db_operation("get_directus_binding")
+    def get_directus_binding(self, scan_id: str, tenant_id: str, subject_id: str):
+        row=self.db.execute("SELECT scan_id,directus_scan_id,tenant_id,subject_id,remote_owner_id,remote_tenant_id,remote_scan_status,membership_active,media_owner_verified,verification_version,verified_at FROM directus_scan_bindings WHERE scan_id=? AND tenant_id=? AND subject_id=?",(scan_id,tenant_id,subject_id)).fetchone()
+        return dict(row) if row else None
+
+    @_db_operation("claim_directus_outbox", transaction=True)
+    def claim_directus_outbox(self, publisher_id: str, *, lease_seconds: float=30, max_attempts: int=8, now: float | None=None):
+        if not publisher_id or not 0<lease_seconds<=600 or not 1<=max_attempts<=12: raise ValueError("publisher limits are invalid")
+        instant=time.time() if now is None else now
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute("UPDATE outbox SET delivery_status='dead',lease_until=NULL,publisher_id=NULL,last_error_code='retry_exhausted' WHERE event_type IN ('scan.completed','scan.failed') AND published_at IS NULL AND attempts>=? AND (delivery_status='pending' OR (delivery_status='running' AND lease_until<=?)) AND event_id IN (SELECT o.event_id FROM outbox o JOIN directus_scan_bindings b ON b.scan_id=o.scan_id)",(max_attempts,instant))
+                row=self.db.execute("""SELECT o.event_id,o.scan_id,o.event_type,o.payload_json,o.attempts,o.fencing_token,
+                    b.directus_scan_id,b.tenant_id,b.subject_id,r.result_json
+                    FROM outbox o JOIN directus_scan_bindings b ON b.scan_id=o.scan_id
+                    LEFT JOIN results r ON r.scan_id=o.scan_id
+                    WHERE o.event_type IN ('scan.completed','scan.failed') AND o.published_at IS NULL AND o.attempts<? AND o.available_at<=?
+                      AND (o.delivery_status='pending' OR (o.delivery_status='running' AND o.lease_until<=?))
+                    ORDER BY o.created_at,o.event_id LIMIT 1""",(max_attempts,instant,instant)).fetchone()
+                if not row:
+                    self.db.execute("COMMIT")
+                    return None
+                fence=row["fencing_token"]+1
+                self.db.execute("UPDATE outbox SET delivery_status='running',attempts=attempts+1,lease_until=?,fencing_token=?,publisher_id=? WHERE event_id=?",(instant+lease_seconds,fence,publisher_id,row["event_id"]))
+                claimed=dict(row)
+                claimed.update({"attempts":row["attempts"]+1,"fencing_token":fence,"publisher_id":publisher_id})
+                claimed["payload_json"]=json.loads(claimed["payload_json"])
+                if claimed["result_json"] is not None: claimed["result_json"]=json.loads(claimed["result_json"])
+                self.db.execute("COMMIT")
+                return claimed
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    @_db_operation("ack_directus_outbox", transaction=True)
+    def ack_directus_outbox(self, event_id: str, publisher_id: str, fencing_token: int,
+                            directus_scan_id: str, remote_status: str, remote_result_scan_id: str | None,
+                            now: float | None=None) -> bool:
+        instant=time.time() if now is None else now
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row=self.db.execute("SELECT o.*,b.directus_scan_id expected_id FROM outbox o JOIN directus_scan_bindings b ON b.scan_id=o.scan_id WHERE o.event_id=?",(event_id,)).fetchone()
+                if (not row or row["delivery_status"]!="running" or row["publisher_id"]!=publisher_id
+                    or row["fencing_token"]!=fencing_token or row["lease_until"] is None
+                    or row["lease_until"]<instant or row["expected_id"]!=directus_scan_id
+                    or (row["event_type"]=="scan.completed" and (directus_scan_id!=remote_result_scan_id or remote_status!="completed"))
+                    or (row["event_type"]=="scan.failed" and (remote_result_scan_id is not None or remote_status!="failed"))):
+                    self.db.execute("COMMIT")
+                    return False
+                self.db.execute("UPDATE outbox SET delivery_status='delivered',published_at=?,lease_until=NULL,publisher_id=NULL,last_error_code=NULL WHERE event_id=?",(instant,event_id))
+                self.db.execute("COMMIT")
+                return True
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    @_db_operation("fail_directus_outbox", transaction=True)
+    def fail_directus_outbox(self, event_id: str, publisher_id: str, fencing_token: int, error_code: str,
+                             *, max_attempts: int=8, retry_base_seconds: float=1, now: float | None=None) -> bool:
+        allowed={"directus_unavailable","directus_timeout","directus_forbidden","directus_schema_mismatch","remote_state_mismatch","unsafe_result_contract","directus_sync_failed"}
+        code=error_code if error_code in allowed else "directus_sync_failed"
+        instant=time.time() if now is None else now
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row=self.db.execute("SELECT attempts,delivery_status,publisher_id,fencing_token,lease_until FROM outbox WHERE event_id=?",(event_id,)).fetchone()
+                valid=(row and row["delivery_status"]=="running" and row["publisher_id"]==publisher_id
+                       and row["fencing_token"]==fencing_token and row["lease_until"] is not None and row["lease_until"]>=instant)
+                if not valid:
+                    self.db.execute("COMMIT")
+                    return False
+                dead=row["attempts"]>=max_attempts
+                if not 0<retry_base_seconds<=60 or not 1<=max_attempts<=12: raise ValueError("publisher retry limits are invalid")
+                delay=min(300,retry_base_seconds*(2**min(8,max(0,row["attempts"]-1))))
+                self.db.execute("UPDATE outbox SET delivery_status=?,available_at=?,lease_until=NULL,publisher_id=NULL,last_error_code=? WHERE event_id=?",("dead" if dead else "pending",instant+delay,code,event_id))
+                self.db.execute("COMMIT")
+                return True
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    @_db_operation("heartbeat")
+    def heartbeat(self, job: dict) -> bool:
+        now=time.time()
+        with self._lock:
+            cursor=self.db.execute("UPDATE jobs SET lease_until=? WHERE job_id=? AND status='running' AND fencing_token=? AND worker_id=? AND lease_until>=?",(now+self.lease_seconds,job["job_id"],job["fencing_token"],job["worker_id"],now))
+            return cursor.rowcount==1
+
+    @_db_operation("fail", transaction=True)
+    def fail(self, job: dict, error_code: str, now: float | None = None):
+        now=now or time.time()
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row=self.db.execute("SELECT * FROM jobs WHERE job_id=?",(job["job_id"],)).fetchone()
+                if not row or row["status"]!="running" or row["fencing_token"]!=job["fencing_token"] or row["worker_id"]!=job["worker_id"] or row["lease_until"] < now:
+                    raise RuntimeError("stale worker lease")
+                if row["attempts"]>=self.max_attempts:
+                    status="failed"; available=now
+                else:
+                    status="queued"; available=now+self.retry_base_seconds*(2**(row["attempts"]-1))
+                self.db.execute("UPDATE jobs SET status=?,available_at=?,lease_until=NULL,worker_id=NULL,last_error=? WHERE job_id=?",(status,available,error_code[:80],job["job_id"]))
+                self.db.execute("UPDATE scans SET status=?,updated_at=? WHERE scan_id=?",(status,now,job["scan_id"]))
+                if status=="failed":
+                    self.db.execute("INSERT OR IGNORE INTO outbox(event_id,scan_id,event_type,payload_json,created_at,published_at,available_at) VALUES(?,?,?,?,?,NULL,?)",(new_id(),job["scan_id"],"scan.failed",json.dumps({"scan_id":job["scan_id"]}),now,now))
+                self.db.execute("COMMIT")
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    @_db_operation("get_scan")
+    def get_scan(self, scan_id: str, tenant_id: str, subject_id: str):
+        row=self.db.execute("SELECT * FROM scans WHERE scan_id=? AND tenant_id=? AND subject_id=?",(scan_id,tenant_id,subject_id)).fetchone()
+        if not row: return None
+        from datetime import datetime, timezone
+        return {"scan_id":row["scan_id"],"status":row["status"],"created_at":datetime.fromtimestamp(row["created_at"],timezone.utc).isoformat(),"updated_at":datetime.fromtimestamp(row["updated_at"],timezone.utc).isoformat()}
+
+    @_db_operation("get_result")
+    def get_result(self, scan_id: str, tenant_id: str, subject_id: str):
+        row=self.db.execute("SELECT result_json FROM results WHERE scan_id=? AND tenant_id=? AND subject_id=?",(scan_id,tenant_id,subject_id)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    @_db_operation("readiness")
+    def readiness(self) -> bool:
+        self.db.execute("SELECT 1").fetchone()
+        return True
+
+    @_db_operation("diagnostics")
+    def diagnostics(self) -> dict[str, int | float | None]:
+        """Return aggregate queue health without exposing job or tenant identifiers."""
+        now = time.time()
+        with self._lock:
+            row = self.db.execute("""
+                SELECT
+                  SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
+                  SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running,
+                  SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS terminal_failures,
+                  SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) AS retries,
+                  MIN(CASE WHEN status='queued' THEN available_at END) AS oldest_queued_at
+                FROM jobs
+            """).fetchone()
+        oldest = row["oldest_queued_at"]
+        return {
+            "queued": row["queued"] or 0,
+            "running": row["running"] or 0,
+            "terminal_failures": row["terminal_failures"] or 0,
+            "retries": row["retries"] or 0,
+            "oldest_queued_age_seconds": round(max(0.0, now-oldest), 3) if oldest is not None else None,
+        }
+
+    @_db_operation("close")
+    def close(self) -> None:
+        with self._lock: self.db.close()

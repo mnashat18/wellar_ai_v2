@@ -16,7 +16,13 @@ def create_queue_store(settings):
 
 def create_media_store(settings,store):
     caps={"video":settings.max_video_bytes,"image":settings.max_image_bytes,"audio":settings.max_audio_bytes}
-    options=dict(max_total_bytes=settings.max_media_total_bytes,max_tenant_bytes=settings.max_media_per_tenant_bytes,max_concurrent_uploads=settings.max_concurrent_uploads)
+    options=dict(max_total_bytes=settings.max_media_total_bytes,max_tenant_bytes=settings.max_media_per_tenant_bytes,
+        max_concurrent_uploads=settings.max_concurrent_uploads,scratch_sweep_max_entries=settings.media_scratch_sweep_max_entries)
     if settings.media_backend=="s3":
-        return S3ObjectMediaStore(settings.media_root,store,caps,bucket=settings.s3_bucket,region=settings.s3_region,endpoint_url=settings.s3_endpoint_url or None,**options)
-    return LocalMediaStore(settings.media_root,store,caps,settings.max_media_total_bytes,settings.max_media_per_tenant_bytes,settings.max_concurrent_uploads)
+        return S3ObjectMediaStore(settings.media_root,store,caps,bucket=settings.s3_bucket,region=settings.s3_region,
+            endpoint_url=settings.s3_endpoint_url or None,delete_connect_timeout_seconds=settings.media_delete_connect_timeout_seconds,
+            delete_read_timeout_seconds=settings.media_delete_read_timeout_seconds,
+            delete_operation_timeout_seconds=settings.media_delete_operation_timeout_seconds,**options)
+    return LocalMediaStore(settings.media_root,store,caps,settings.max_media_total_bytes,settings.max_media_per_tenant_bytes,
+        settings.max_concurrent_uploads,delete_timeout_seconds=settings.media_delete_operation_timeout_seconds,**{
+            "scratch_sweep_max_entries":settings.media_scratch_sweep_max_entries})

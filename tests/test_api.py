@@ -25,6 +25,10 @@ def test_submit_worker_result_and_tenant_access(client,auth,store):
     assert result.status_code==200
     assert result.json()["status"]=="insufficient_evidence"
     assert result.json()["targets"]["reference_sleepiness"]["value"] is None
+    assert result.json()["measurements"]["schema_version"]=="wellar.dual-measurements/1.0"
+    assert result.json()["measurements"]["fatigue"]["status"]=="unavailable"
+    assert result.json()["measurements"]["fatigue"]["value"] is None
+    assert result.json()["measurements"]["vigilance"]["status"]=="not_provided"
     assert client.get(f"/api/v1/scans/{sid}",headers={"Authorization":"Bearer token-other"}).status_code==404
 
 
@@ -45,7 +49,7 @@ def test_auth_and_idempotency_conflict(client,auth):
     assert client.post("/api/v1/scans",json=BODY).status_code==401
     headers={**auth,"Idempotency-Key":"same"}
     first=client.post("/api/v1/scans",headers=headers,json=BODY)
-    conflict={**BODY,"consent":{"media_processing":True,"research_use":True},"reaction_task":{"task_type":"pvt","trials":[{"trial_index":0,"stimulus_timestamp_ms":100,"response_timestamp_ms":450}]}}
+    conflict={**BODY,"consent":{"media_processing":True,"consent_version":"operational-media-v1","research_use":False},"reaction_task":{"task_type":"pvt","trials":[{"trial_index":0,"stimulus_timestamp_ms":100,"response_timestamp_ms":450}]}}
     second=client.post("/api/v1/scans",headers=headers,json=conflict)
     assert first.status_code==202 and second.status_code==409
 

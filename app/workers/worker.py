@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 import hashlib
@@ -11,6 +12,8 @@ from opentelemetry import context,propagate,trace
 from app.core.logging import event, request_id_var,trace_id_var
 from app.observability.metrics import worker_metrics
 from app.drowsiness_indicator import classify as classify_drowsiness
+from app.measurements.dual_output import dual_measurement_output
+from app.behavioral.engine import build_behavioral_evidence
 from app.media.reconciliation import MediaReconciler,delete_with_retry
 
 logger=logging.getLogger("wellar.worker")
@@ -18,6 +21,16 @@ logger=logging.getLogger("wellar.worker")
 
 def research_only_processor(payload: dict) -> dict:
     """Default safe stub: no media/model inference and no fatigue score."""
+    report = payload.get("subjective_fatigue") if isinstance(payload, dict) else None
+    legacy_reference = None
+    if isinstance(report, dict) and report.get("collection_consent") is True:
+        legacy_reference = {
+            "score": report.get("score"),
+            "instrument": report.get("instrument", "wellar_custom_fatigue_rating_0_10"),
+            "question_version": report.get("question_version", "legacy_prompt_unverified"),
+            "collection_consent": True,
+        }
+    measurements=dual_measurement_output(None, legacy_reference=legacy_reference)
     return {
         "status": "insufficient_evidence",
         "model_version": None,
@@ -25,6 +38,8 @@ def research_only_processor(payload: dict) -> dict:
             "reference_sleepiness": {"status":"unavailable","value":None},
             "vigilance_impairment": {"status":"unavailable","value":None},
         },
+        "measurements": measurements,
+        "behavioral_evidence": build_behavioral_evidence({}, measurements),
         "drowsiness_indicator": classify_drowsiness({}),
         "quality": {"video":"not_processed","image":"not_processed","audio":"not_processed","reaction_task":"not_provided"},
         "message": "No authorized, validated analysis pipeline is configured.",
@@ -32,33 +47,75 @@ def research_only_processor(payload: dict) -> dict:
 
 
 class Worker:
-    def __init__(self, store, worker_id: str, processor: Callable[[dict],dict]=research_only_processor):
+    def __init__(self, store, worker_id: str, processor: Callable[[dict],dict]=research_only_processor, *, reconciliation_page_size: int=50, reconciliation_max_pages: int=5, reconciliation_max_references: int=500, reconciliation_lease_seconds: int=300, reconciliation_delete_attempts:int=3,reconciliation_delete_retry_deadline_seconds:float=16.0,reconciliation_retry_initial_seconds:float=1.0,reconciliation_retry_multiplier:float=2.0,reconciliation_retry_max_seconds:float=300.0,reconciliation_retry_jitter:float=0.2,reconciliation_stop_event=None):
         self.store,self.worker_id,self.processor=store,worker_id,processor
         media_store=getattr(processor,"media_store",None)
-        self.reconciler=MediaReconciler(media_store,store) if media_store is not None and callable(getattr(store,"list_terminal_scan_media_refs",None)) else None
+        self.reconciler=MediaReconciler(media_store,store,page_size=reconciliation_page_size,max_pages_per_run=reconciliation_max_pages,max_references_per_run=reconciliation_max_references,lease_seconds=reconciliation_lease_seconds,delete_attempts=reconciliation_delete_attempts,delete_retry_deadline_seconds=reconciliation_delete_retry_deadline_seconds) if media_store is not None and callable(getattr(store,"list_terminal_scan_media_refs",None)) else None
         self._last_reconciliation=0.0
+        self._reconciliation_interval_seconds=300.0
+        self._reconciliation_retry_initial=max(0.1,float(reconciliation_retry_initial_seconds))
+        self._reconciliation_retry_multiplier=max(1.1,float(reconciliation_retry_multiplier))
+        self._reconciliation_retry_max=max(self._reconciliation_retry_initial,float(reconciliation_retry_max_seconds))
+        self._reconciliation_retry_jitter=max(0.0,min(float(reconciliation_retry_jitter),0.5))
+        self._reconciliation_failures=0
+        self._next_reconciliation_at=0.0
         self._last_directus_reconciliation=0.0
+        self._directus_reconciliation_failures=0
+        self._next_directus_reconciliation_at=0.0
         if self.reconciler is not None:
-            self._reconcile_media()
+            self._reconcile_media(stop_event=reconciliation_stop_event)
         self._reconcile_directus_deletions()
 
-    def _reconcile_media(self):
+    def _reconcile_media(self,stop_event=None):
         try:
-            self.reconciler.run_once()
-            self._last_reconciliation=time.monotonic()
+            result=self.reconciler.run_once(stop_event=stop_event) if stop_event is not None else self.reconciler.run_once()
         except Exception as exc:
+            self._reconciliation_failures+=1
+            delay=min(self._reconciliation_retry_max,self._reconciliation_retry_initial*(self._reconciliation_retry_multiplier**(self._reconciliation_failures-1)))
+            delay=min(self._reconciliation_retry_max,delay*random.uniform(1-self._reconciliation_retry_jitter,1+self._reconciliation_retry_jitter))
+            self._next_reconciliation_at=time.monotonic()+delay
             worker_metrics.increment("storage","reconciliation_failed")
-            event(logger,"media.reconciliation.failed",logging.ERROR,processing_stage="media_reconciliation",error_code="reconciliation_failed",exception_type=type(exc).__name__)
+            event(logger,"media.reconciliation.failed",logging.ERROR,processing_stage="media_reconciliation",error_code="reconciliation_run_failed",exception_type=type(exc).__name__,retry_delay_seconds=round(delay,3))
+            return {"run_status":"failed","retry_delay_seconds":delay}
+        self._last_reconciliation=time.monotonic()
+        status=result.get("run_status","complete") if isinstance(result,dict) else "complete"
+        per_item_failures=int(result.get("deletion_failed",0)) if isinstance(result,dict) else 0
+        if status=="partial" and per_item_failures>0:
+            self._reconciliation_failures+=1
+            delay=min(self._reconciliation_retry_max,self._reconciliation_retry_initial*(self._reconciliation_retry_multiplier**(self._reconciliation_failures-1)))
+            delay=min(self._reconciliation_retry_max,delay*random.uniform(1-self._reconciliation_retry_jitter,1+self._reconciliation_retry_jitter))
+            self._next_reconciliation_at=self._last_reconciliation+delay
+        elif status=="partial" or status=="lease_busy":
+            # Partial checkpoint work and another owner's lease are distinct from
+            # a failed run; retry after a bounded scheduler delay without hot-looping.
+            if status=="partial":self._reconciliation_failures=0
+            if status=="lease_busy":
+                event(logger,"media.reconciliation.lease_busy",logging.WARNING,processing_stage="media_reconciliation",error_code="reconciliation_lease_busy")
+            delay=random.uniform(self._reconciliation_retry_initial,
+                min(self._reconciliation_retry_max,self._reconciliation_retry_initial*(1+self._reconciliation_retry_jitter)))
+            self._next_reconciliation_at=self._last_reconciliation+delay
+        else:
+            self._reconciliation_failures=0
+            self._next_reconciliation_at=self._last_reconciliation+self._reconciliation_interval_seconds
+        return result
 
     def _reconcile_directus_deletions(self):
         reconcile=getattr(self.processor,"reconcile_pending_deletions",None)
-        if not callable(reconcile):return
+        if not callable(reconcile):
+            self._next_directus_reconciliation_at=time.monotonic()+self._reconciliation_interval_seconds
+            return
         try:
             reconcile()
             self._last_directus_reconciliation=time.monotonic()
+            self._directus_reconciliation_failures=0
+            self._next_directus_reconciliation_at=self._last_directus_reconciliation+self._reconciliation_interval_seconds
         except Exception as exc:
+            self._directus_reconciliation_failures+=1
+            delay=min(self._reconciliation_retry_max,self._reconciliation_retry_initial*(self._reconciliation_retry_multiplier**(self._directus_reconciliation_failures-1)))
+            delay=min(self._reconciliation_retry_max,delay*random.uniform(1-self._reconciliation_retry_jitter,1+self._reconciliation_retry_jitter))
+            self._next_directus_reconciliation_at=time.monotonic()+delay
             worker_metrics.increment("storage","directus_deletion_failed")
-            event(logger,"directus.deletion.reconciliation_failed",logging.ERROR,processing_stage="directus_cleanup",error_code="directus_deletion_failed",exception_type=type(exc).__name__)
+            event(logger,"directus.deletion.reconciliation_failed",logging.ERROR,processing_stage="directus_cleanup",error_code="directus_deletion_failed",exception_type=type(exc).__name__,retry_delay_seconds=round(delay,3))
 
     def _delete_payload_media(self,payload,job):
         media_store=getattr(self.processor,"media_store",None)
@@ -119,6 +176,10 @@ class Worker:
             result["scan_id"]=job["scan_id"]
             persistence_started=time.perf_counter()
             self.store.complete(job,result)
+            # Keep native scan media available until the durable result commit;
+            # failed analysis or persistence must remain safely retryable.
+            if not payload.get("_directus_pull"):
+                self._delete_payload_media(payload,job)
             heartbeat_stop.set(); heartbeat_thread.join(timeout=heartbeat_interval+0.1)
             event(logger,"scan.processing.stage_completed",processing_stage="result_commit",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,duration_ms=round((time.perf_counter()-persistence_started)*1000,3))
             event(logger,"scan.processing.completed",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,processing_stage="result_commit",duration_ms=round((time.perf_counter()-start)*1000,3),attempt=job["attempts"])
@@ -153,8 +214,15 @@ class Worker:
 
     def run_forever(self, stop_event, idle_seconds: float=0.05):
         while not stop_event.is_set():
-            if self.reconciler is not None and time.monotonic()-self._last_reconciliation>=300:
-                self._reconcile_media()
-            if time.monotonic()-self._last_directus_reconciliation>=300:
+            if self.reconciler is not None and time.monotonic()>=self._next_reconciliation_at:
+                self._reconcile_media(stop_event=stop_event)
+            if stop_event.is_set():break
+            if time.monotonic()>=self._next_directus_reconciliation_at:
                 self._reconcile_directus_deletions()
-            if not self.run_once(): stop_event.wait(idle_seconds)
+            if stop_event.is_set():break
+            if not self.run_once():
+                wait_seconds=max(0.0,float(idle_seconds))
+                if self.reconciler is not None:
+                    wait_seconds=min(wait_seconds,max(0.0,self._next_reconciliation_at-time.monotonic()))
+                wait_seconds=min(wait_seconds,max(0.0,self._next_directus_reconciliation_at-time.monotonic()))
+                stop_event.wait(wait_seconds)

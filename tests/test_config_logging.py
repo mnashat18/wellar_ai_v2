@@ -12,6 +12,19 @@ def test_sqlite_refused_for_staging():
         Settings(environment="staging").validate()
 
 
+def test_multiple_worker_replicas_require_postgres():
+    with pytest.raises(ValueError,match="multiple worker processes require PostgreSQL"):
+        Settings(environment="development",worker_count=2,queue_backend="sqlite").validate()
+    settings=Settings(environment="development",worker_count=4,queue_backend="postgres",
+        postgres_dsn="postgresql://worker-test@db/test")
+    settings.validate()
+
+
+def test_worker_count_must_be_positive():
+    with pytest.raises(ValueError,match="worker count"):
+        Settings(environment="development",worker_count=0).validate()
+
+
 def test_dev_auth_tokens_refused_outside_development():
     with pytest.raises(ValueError,match="forbidden"):
         Settings(environment="production",dev_auth_tokens={"x":{"sub":"s","tenant_id":"t"}}).validate()

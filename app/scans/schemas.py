@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import re
+
+
+OPERATIONAL_MEDIA_CONSENT_VERSION = "operational-media-v1"
 
 
 class ReactionTask(BaseModel):
@@ -10,6 +14,12 @@ class ReactionTask(BaseModel):
     task_type: str = Field(pattern=r"^(pvt|simple_reaction)$")
     trials: list["ReactionTrial"] = Field(min_length=1, max_length=100)
     timing_metadata: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=16)
+    # Claims supplied by the task client are retained as provenance, never treated
+    # as verified device timing by the backend.
+    device_clock: str = Field(default="unknown", pattern=r"^(unknown|monotonic|performance|wall_clock)$")
+    timestamp_resolution_ms: float | None = Field(default=None, ge=0, le=1000)
+    planned_trial_count: int | None = Field(default=None, ge=1, le=100)
+    client_reported_completed: bool | None = None
 
     @model_validator(mode="after")
     def ordered_trials(self):
@@ -40,6 +50,8 @@ class ScanSubmission(BaseModel):
     def require_consent_for_media(self):
         if (self.media_refs or self.reaction_task is not None) and (self.consent is None or not self.consent.media_processing):
             raise ValueError("media-processing consent is required for media and reaction_task inputs")
+        if (self.media_refs or self.reaction_task is not None) and self.consent.consent_version != OPERATIONAL_MEDIA_CONSENT_VERSION:
+            raise ValueError("a supported operational media consent version is required")
         if len(set(self.media_refs)) != len(self.media_refs):
             raise ValueError("duplicate media_refs are not allowed")
         return self
@@ -56,18 +68,29 @@ class ScanSubmission(BaseModel):
 class MediaConsent(BaseModel):
     model_config = ConfigDict(extra="forbid")
     media_processing: bool
+    consent_version: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
     # Research/dataset use is a separate permission and is never implied by
-    # permission to process a user's operational scan.
+    # permission to process a user's operational scan. The workflow is not
+    # governed yet, so this operational endpoint must reject it when selected.
     research_use: bool = False
+
+    @model_validator(mode="after")
+    def reject_ungoverned_research_use(self):
+        if self.research_use:
+            raise ValueError("research use consent is not available in operational scan submission")
+        return self
 
 
 class SubjectiveFatigue(BaseModel):
-    """Optional, unvalidated Wellar research item; kept separate from predictions."""
+    """Explicit participant report; custom item is not a validated fatigue scale."""
     model_config = ConfigDict(extra="forbid")
     schema_version: str = "1.0"
-    instrument: str = "wellar_custom_fatigue_rating_0_10"
+    instrument: Literal["wellar_custom_fatigue_rating_0_10"] = "wellar_custom_fatigue_rating_0_10"
     score: int | None = Field(default=None, ge=0, le=10)
     collection_consent: bool = False
+    # Legacy payloads remain compatible, but their original prompt/anchors are
+    # unknown. New clients may assert the exact backend-defined item version.
+    question_version: Literal["legacy_prompt_unverified", "wellar-fatigue-self-report/1.0"] = "legacy_prompt_unverified"
 
     @model_validator(mode="after")
     def enforce_collection_opt_in(self):
@@ -76,6 +99,7 @@ class SubjectiveFatigue(BaseModel):
         if not self.collection_consent:
             # Discard any supplied value before it can be persisted in the queue.
             self.score = None
+            self.question_version = "legacy_prompt_unverified"
         return self
 
 
@@ -94,6 +118,8 @@ class ScanResult(BaseModel):
     model_version: str | None = None
     model_invocation_status: str = "not_invoked_no_validated_model"
     targets: dict[str, object] = Field(default_factory=dict)
+    measurements: dict[str, object] = Field(default_factory=dict)
+    behavioral_evidence: dict[str, object] | None = None
     prediction_extension: dict[str, object] | None = None
     subjective_reference: dict[str, str | int | bool] | None = None
     evidence: dict[str, object] | None = None
