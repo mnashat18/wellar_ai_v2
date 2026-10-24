@@ -26,3 +26,19 @@ def create_media_store(settings,store):
     return LocalMediaStore(settings.media_root,store,caps,settings.max_media_total_bytes,settings.max_media_per_tenant_bytes,
         settings.max_concurrent_uploads,delete_timeout_seconds=settings.media_delete_operation_timeout_seconds,**{
             "scratch_sweep_max_entries":settings.media_scratch_sweep_max_entries})
+
+
+def create_analysis_processor(settings,media_store):
+    """Build the configured feature processor, loading only guarded local releases."""
+    from app.media.analysis import MultimodalFeatureProcessor
+    from app.ml.registry import load_predictors
+
+    enabled=settings.model_inference_enabled
+    predictors=load_predictors(enabled=enabled,artifact_dir=settings.model_artifact_dir)
+    return MultimodalFeatureProcessor(media_store,max_video_seconds=settings.max_video_seconds,
+        max_audio_seconds=settings.max_audio_seconds,max_image_pixels=settings.max_image_pixels,
+        max_video_frames=settings.max_video_frames,video_sample_hz=settings.video_sample_hz,
+        decode_timeout_seconds=settings.decode_timeout_seconds,
+        decode_memory_limit_mb=settings.decode_memory_limit_mb,
+        analysis_timeout_seconds=settings.worker_drain_seconds,predictors=predictors,
+        prediction_enabled=enabled)

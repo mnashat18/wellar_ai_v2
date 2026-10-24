@@ -134,6 +134,28 @@ def test_postgres_concurrent_claim_fencing_idempotency_capacity_and_rollback(pos
     assert store.get_scan(retry_scan["scan_id"],"tenant","sub")["status"]=="failed"
 
 
+def test_postgres_heartbeat_renews_only_current_unexpired_lease(postgres_store):
+    store=postgres_store
+    accepted,_=submit(store,"heartbeat-fencing-"+uuid4().hex)
+    stale=store.claim("heartbeat-owner")
+    assert stale and stale["scan_id"]==accepted["scan_id"]
+    with store.pool.connection() as conn:
+        before=conn.execute("SELECT lease_until FROM jobs WHERE job_id=%s",(stale["job_id"],)).fetchone()["lease_until"]
+    assert store.heartbeat(stale) is True
+    with store.pool.connection() as conn:
+        after=conn.execute("SELECT lease_until FROM jobs WHERE job_id=%s",(stale["job_id"],)).fetchone()["lease_until"]
+        conn.execute("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id=%s",(stale["job_id"],))
+    assert after>before
+    assert store.heartbeat(stale) is False
+
+    recovered=store.claim("heartbeat-recovery")
+    assert recovered and recovered["fencing_token"]==stale["fencing_token"]+1
+    with pytest.raises(RuntimeError):store.complete(stale,{"status":"stale"})
+    assert store.get_result(accepted["scan_id"],"tenant","sub") is None
+    store.complete(recovered,{"status":"completed"})
+    assert store.get_result(accepted["scan_id"],"tenant","sub")["status"]=="completed"
+
+
 def test_postgres_worker_crash_lease_recovery_and_fenced_completion(postgres_store,tmp_path):
     store=postgres_store
     namespace=uuid4().hex

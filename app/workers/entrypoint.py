@@ -11,8 +11,7 @@ import uuid
 
 from app.core.config import Settings
 from app.core.logging import configure_logging,event
-from app.media.analysis import MultimodalFeatureProcessor
-from app.core.adapters import create_media_store,create_queue_store
+from app.core.adapters import create_analysis_processor,create_media_store,create_queue_store
 from app.workers.worker import Worker
 from app.compat.directus_facade import DirectusHTTPClient,DirectusPullProcessor
 
@@ -39,7 +38,7 @@ def main() -> None:
         store=create_queue_store(settings)
         media_store=create_media_store(settings,store)
         # Stage 1 runs media feature extraction only; no prediction artifacts load.
-        processor=MultimodalFeatureProcessor(media_store,max_video_seconds=settings.max_video_seconds,max_audio_seconds=settings.max_audio_seconds,max_image_pixels=settings.max_image_pixels,max_video_frames=settings.max_video_frames,video_sample_hz=settings.video_sample_hz,decode_timeout_seconds=settings.decode_timeout_seconds,decode_memory_limit_mb=settings.decode_memory_limit_mb,analysis_timeout_seconds=settings.worker_drain_seconds)
+        processor=create_analysis_processor(settings,media_store)
         processor.warmup()
         if settings.directus_pull_enabled:
             processor=DirectusPullProcessor(DirectusHTTPClient(settings.directus_url,settings.directus_service_token,timeout=settings.directus_timeout_seconds),media_store,processor)

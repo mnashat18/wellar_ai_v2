@@ -17,7 +17,7 @@ from app.core.errors import WellarError
 from app.core.logging import configure_logging, event
 from app.core.logging import request_id_var
 from app.observability.metrics import BoundedMetrics, worker_metrics
-from app.core.adapters import create_media_store, create_queue_store
+from app.core.adapters import create_analysis_processor,create_media_store,create_queue_store
 from app.queue.sqlite_store import sqlite_error_details
 from app.security.auth import DevelopmentAuthenticator, DirectusAuthenticator, JWTAuthenticator
 from app.security.rate_limit import TenantRateLimiter
@@ -41,8 +41,7 @@ def create_app(settings: Settings | None=None, store=None, authenticator=None) -
         if app.state.store.readiness() is not True:
             raise RuntimeError("storage readiness check failed")
         app.state.media_store=create_media_store(settings,app.state.store)
-        from app.media.analysis import MultimodalFeatureProcessor
-        delegate=MultimodalFeatureProcessor(app.state.media_store,max_video_seconds=settings.max_video_seconds,max_audio_seconds=settings.max_audio_seconds,max_image_pixels=settings.max_image_pixels,max_video_frames=settings.max_video_frames,video_sample_hz=settings.video_sample_hz,decode_timeout_seconds=settings.decode_timeout_seconds,decode_memory_limit_mb=settings.decode_memory_limit_mb,analysis_timeout_seconds=settings.worker_drain_seconds)
+        delegate=create_analysis_processor(settings,app.state.media_store)
         app.state.worker_processor=(DirectusPullProcessor(DirectusHTTPClient(settings.directus_url,settings.directus_service_token,timeout=settings.directus_timeout_seconds),app.state.media_store,delegate) if settings.directus_pull_enabled else delegate)
         app.state.ready=True
         event(logger,"application.started",processing_stage="startup")

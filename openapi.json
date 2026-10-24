@@ -249,6 +249,11 @@
       "MediaConsent": {
         "additionalProperties": false,
         "properties": {
+          "consent_version": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "title": "Consent Version",
+            "type": "string"
+          },
           "media_processing": {
             "title": "Media Processing",
             "type": "boolean"
@@ -260,7 +265,8 @@
           }
         },
         "required": [
-          "media_processing"
+          "media_processing",
+          "consent_version"
         ],
         "title": "MediaConsent",
         "type": "object"
@@ -268,6 +274,36 @@
       "ReactionTask": {
         "additionalProperties": false,
         "properties": {
+          "client_reported_completed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Reported Completed"
+          },
+          "device_clock": {
+            "default": "unknown",
+            "pattern": "^(unknown|monotonic|performance|wall_clock)$",
+            "title": "Device Clock",
+            "type": "string"
+          },
+          "planned_trial_count": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Trial Count"
+          },
           "schema_version": {
             "default": "1.0",
             "title": "Schema Version",
@@ -277,6 +313,19 @@
             "pattern": "^(pvt|simple_reaction)$",
             "title": "Task Type",
             "type": "string"
+          },
+          "timestamp_resolution_ms": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timestamp Resolution Ms"
           },
           "timing_metadata": {
             "additionalProperties": {
@@ -354,6 +403,18 @@
       },
       "ScanResult": {
         "properties": {
+          "behavioral_evidence": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Behavioral Evidence"
+          },
           "drowsiness_indicator": {
             "anyOf": [
               {
@@ -381,6 +442,11 @@
           "features": {
             "additionalProperties": true,
             "title": "Features",
+            "type": "object"
+          },
+          "measurements": {
+            "additionalProperties": true,
+            "title": "Measurements",
             "type": "object"
           },
           "message": {
@@ -556,7 +622,7 @@
       },
       "SubjectiveFatigue": {
         "additionalProperties": false,
-        "description": "Optional, unvalidated Wellar research item; kept separate from predictions.",
+        "description": "Explicit participant report; custom item is not a validated fatigue scale.",
         "properties": {
           "collection_consent": {
             "default": false,
@@ -564,8 +630,18 @@
             "type": "boolean"
           },
           "instrument": {
+            "const": "wellar_custom_fatigue_rating_0_10",
             "default": "wellar_custom_fatigue_rating_0_10",
             "title": "Instrument",
+            "type": "string"
+          },
+          "question_version": {
+            "default": "legacy_prompt_unverified",
+            "enum": [
+              "legacy_prompt_unverified",
+              "wellar-fatigue-self-report/1.0"
+            ],
+            "title": "Question Version",
             "type": "string"
           },
           "schema_version": {

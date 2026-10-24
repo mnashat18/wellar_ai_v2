@@ -160,10 +160,31 @@ class Worker:
         event(logger,"scan.processing.stage_completed",processing_stage="queue_wait",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,duration_ms=round(max(0,queue_wait_seconds)*1000,3),duration_clock=queue_wait_clock)
         worker_metrics.increment("stage","queue_wait")
         heartbeat_stop=threading.Event()
+        heartbeat_lost=threading.Event()
         heartbeat_interval=max(0.1,self.store.lease_seconds/3)
         def maintain_lease():
+            failures=0
             while not heartbeat_stop.wait(heartbeat_interval):
-                if not self.store.heartbeat(job): return
+                try:
+                    renewed=self.store.heartbeat(job)
+                except Exception as exc:
+                    failures+=1
+                    event(logger,"scan.processing.heartbeat.failed",logging.WARNING,
+                        scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,
+                        tenant_ref=tenant_ref,processing_stage="lease",error_code="lease_heartbeat_error",
+                        exception_type=type(exc).__name__,attempt=failures)
+                    continue
+                if not renewed:
+                    heartbeat_lost.set()
+                    event(logger,"scan.processing.heartbeat.rejected",logging.WARNING,
+                        scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,
+                        tenant_ref=tenant_ref,processing_stage="lease",error_code="lease_heartbeat_rejected")
+                    return
+                if failures:
+                    event(logger,"scan.processing.heartbeat.recovered",logging.INFO,
+                        scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,
+                        tenant_ref=tenant_ref,processing_stage="lease",recovered_after_failures=failures)
+                    failures=0
         heartbeat_thread=threading.Thread(target=maintain_lease,daemon=True)
         heartbeat_thread.start()
         try:
@@ -174,26 +195,34 @@ class Worker:
             event(logger,"scan.processing.stage_completed",processing_stage="analysis",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,duration_ms=round((time.perf_counter()-analysis_started)*1000,3))
             worker_metrics.increment("stage","analysis")
             result["scan_id"]=job["scan_id"]
+            # Stop and join the heartbeat before the terminal transition. This
+            # prevents a ping racing with completion and mistaking the now-
+            # completed row for a lost lease.
+            heartbeat_stop.set(); heartbeat_thread.join()
+            if heartbeat_lost.is_set():
+                raise RuntimeError("stale worker lease")
             persistence_started=time.perf_counter()
             self.store.complete(job,result)
             # Keep native scan media available until the durable result commit;
             # failed analysis or persistence must remain safely retryable.
             if not payload.get("_directus_pull"):
                 self._delete_payload_media(payload,job)
-            heartbeat_stop.set(); heartbeat_thread.join(timeout=heartbeat_interval+0.1)
             event(logger,"scan.processing.stage_completed",processing_stage="result_commit",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,duration_ms=round((time.perf_counter()-persistence_started)*1000,3))
             event(logger,"scan.processing.completed",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,processing_stage="result_commit",duration_ms=round((time.perf_counter()-start)*1000,3),attempt=job["attempts"])
             worker_metrics.increment("stage","result_commit"); worker_metrics.increment("outcome","success")
         except Exception as exc:
             span.set_attribute("error",True)
-            heartbeat_stop.set(); heartbeat_thread.join(timeout=heartbeat_interval+0.1)
+            heartbeat_stop.set(); heartbeat_thread.join()
+            if heartbeat_lost.is_set():
+                # A worker that no longer owns the lease must not mutate queue
+                # state or delete media; the current owner/reaper handles it.
+                event(logger,"scan.processing.lease_lost",logging.WARNING,scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,processing_stage="lease",error_code="lease_lost")
+                return True
             retryable=(getattr(exc,"retryable",True) and not isinstance(exc,ValueError)
                        and job["attempts"] < self.store.max_attempts)
             # Native jobs need their uploaded media for a retry. Directus jobs
             # refetch remote files on every attempt, and the facade also cleans
             # any staged V2 copies in its own finally block.
-            if payload.get("_directus_pull") or not retryable:
-                self._delete_payload_media(payload,job)
             safe_failure_codes={"stale worker lease":"lease_lost","scan media deletion failed":"media_delete_failed"}
             failure_code=getattr(exc,"error_code",None)
             if not isinstance(failure_code,str) or not re.fullmatch(r"[a-z0-9_.-]{1,80}",failure_code):
@@ -203,6 +232,16 @@ class Worker:
             except RuntimeError:
                 event(logger,"scan.processing.lease_lost",logging.WARNING,scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,processing_stage="lease",error_code="lease_lost")
                 return True
+            if payload.get("_directus_pull") or not retryable:
+                # Only clean media after the queue accepted this worker's
+                # failure transition. A stale worker must leave it untouched.
+                try:
+                    self._delete_payload_media(payload,job)
+                except Exception as cleanup_exc:
+                    event(logger,"scan.processing.media_cleanup_failed",logging.ERROR,
+                        scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,
+                        tenant_ref=tenant_ref,processing_stage="media_cleanup",
+                        error_code="media_delete_failed",exception_type=type(cleanup_exc).__name__)
             worker_metrics.increment("outcome","retry" if retryable else "failure")
             event(logger,"scan.processing.retry_scheduled" if retryable else "scan.processing.failed",logging.WARNING if retryable else logging.ERROR,scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,processing_stage="analysis",error_code=failure_code,exception_type=type(exc).__name__,attempt=job["attempts"])
         finally:

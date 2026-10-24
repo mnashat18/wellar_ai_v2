@@ -88,8 +88,8 @@ class PostgresQueueStore:
 
     def claim(self, worker_id: str, now: float|None=None):
         started=time.perf_counter()
-        instant=datetime.fromtimestamp(now,timezone.utc) if now is not None else datetime.now(timezone.utc)
         with self.pool.connection() as conn, conn.transaction():
+            instant=datetime.fromtimestamp(now,timezone.utc) if now is not None else conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
             # Serialize terminal transitions against reconciliation-cycle snapshots.
             terminal_work=conn.execute("SELECT 1 FROM jobs WHERE (status='running' AND lease_until < %s AND attempts >= %s) OR (status='queued' AND attempts >= %s) LIMIT 1",(instant,self.max_attempts,self.max_attempts)).fetchone()
             if terminal_work:
@@ -100,9 +100,10 @@ class PostgresQueueStore:
             conn.execute("UPDATE scans SET status='queued',updated_at=%s WHERE scan_id IN (SELECT scan_id FROM jobs WHERE status='queued') AND status='processing'",(instant,))
             row=conn.execute("SELECT * FROM jobs WHERE status='queued' AND available_at<=%s AND attempts<%s ORDER BY available_at LIMIT 1 FOR UPDATE SKIP LOCKED",(instant,self.max_attempts)).fetchone()
             if not row: return None
-            lease=instant+timedelta(seconds=self.lease_seconds)
+            claimed_at=datetime.fromtimestamp(now,timezone.utc) if now is not None else conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+            lease=claimed_at+timedelta(seconds=self.lease_seconds)
             updated=conn.execute("UPDATE jobs SET status='running',attempts=attempts+1,worker_id=%s,lease_until=%s,fencing_token=fencing_token+1 WHERE job_id=%s RETURNING *",(worker_id,lease,row["job_id"])).fetchone()
-            conn.execute("UPDATE scans SET status='processing',updated_at=%s WHERE scan_id=%s",(instant,row["scan_id"]))
+            conn.execute("UPDATE scans SET status='processing',updated_at=%s WHERE scan_id=%s",(claimed_at,row["scan_id"]))
             scan=conn.execute("SELECT payload_json,request_id,created_at,tenant_id,subject_id FROM scans WHERE scan_id=%s",(row["scan_id"],)).fetchone()
             updated.update(scan); updated["payload_json"]=json.dumps(scan["payload_json"])
             updated["created_at"]=scan["created_at"].timestamp()
@@ -112,14 +113,15 @@ class PostgresQueueStore:
 
     def heartbeat(self,job):
         with self.pool.connection() as conn:
-            row=conn.execute("UPDATE jobs SET lease_until=now()+(%s * interval '1 second') WHERE job_id=%s AND status='running' AND fencing_token=%s AND worker_id=%s AND lease_until>=now() RETURNING job_id",(self.lease_seconds,job["job_id"],job["fencing_token"],job["worker_id"])).fetchone()
+            row=conn.execute("WITH lease_clock AS (SELECT clock_timestamp() AS instant) UPDATE jobs AS j SET lease_until=lease_clock.instant+(%s * interval '1 second') FROM lease_clock WHERE j.job_id=%s AND j.status='running' AND j.fencing_token=%s AND j.worker_id=%s AND j.lease_until>=lease_clock.instant RETURNING j.job_id",(self.lease_seconds,job["job_id"],job["fencing_token"],job["worker_id"])).fetchone()
             return row is not None
 
     def complete(self,job,result):
         started=time.perf_counter()
         with self.pool.connection() as conn,conn.transaction():
             row=conn.execute("SELECT * FROM jobs WHERE job_id=%s FOR UPDATE",(job["job_id"],)).fetchone()
-            if not row or row["status"]!="running" or row["fencing_token"]!=job["fencing_token"] or row["worker_id"]!=job["worker_id"] or row["lease_until"]<datetime.now(timezone.utc): raise RuntimeError("stale worker lease")
+            lease_valid=bool(row and row["lease_until"] and conn.execute("SELECT %s::timestamptz>=clock_timestamp() AS valid",(row["lease_until"],)).fetchone()["valid"])
+            if not row or row["status"]!="running" or row["fencing_token"]!=job["fencing_token"] or row["worker_id"]!=job["worker_id"] or not lease_valid: raise RuntimeError("stale worker lease")
             scan=conn.execute("SELECT tenant_id,subject_id FROM scans WHERE scan_id=%s",(job["scan_id"],)).fetchone()
             conn.execute("INSERT INTO results(scan_id,tenant_id,subject_id,result_json) VALUES(%s,%s,%s,%s::jsonb) ON CONFLICT(scan_id) DO NOTHING",(job["scan_id"],scan["tenant_id"],scan["subject_id"],json.dumps(result,sort_keys=True)))
             conn.execute("UPDATE jobs SET status='completed',lease_until=NULL WHERE job_id=%s",(job["job_id"],))
@@ -211,10 +213,11 @@ class PostgresQueueStore:
 
     def fail(self,job,error_code,now=None,*,force_terminal=False):
         started=time.perf_counter()
-        instant=datetime.fromtimestamp(now,timezone.utc) if now is not None else datetime.now(timezone.utc)
         with self.pool.connection() as conn,conn.transaction():
             row=conn.execute("SELECT * FROM jobs WHERE job_id=%s FOR UPDATE",(job["job_id"],)).fetchone()
-            if not row or row["status"]!="running" or row["fencing_token"]!=job["fencing_token"] or row["worker_id"]!=job["worker_id"] or row["lease_until"]<instant: raise RuntimeError("stale worker lease")
+            instant=datetime.fromtimestamp(now,timezone.utc) if now is not None else conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+            lease_valid=bool(row and row["lease_until"] and (row["lease_until"]>=instant if now is not None else conn.execute("SELECT %s::timestamptz>=clock_timestamp() AS valid",(row["lease_until"],)).fetchone()["valid"]))
+            if not row or row["status"]!="running" or row["fencing_token"]!=job["fencing_token"] or row["worker_id"]!=job["worker_id"] or not lease_valid: raise RuntimeError("stale worker lease")
             terminal=force_terminal or row["attempts"]>=self.max_attempts
             status="failed" if terminal else "queued"
             available=instant+timedelta(seconds=self.retry_base_seconds*(2**max(0,row["attempts"]-1)))

@@ -1,5 +1,7 @@
 import time
 import threading
+import logging
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -72,6 +74,103 @@ def test_final_expired_lease_becomes_terminal(store):
     assert second["attempts"]==2
     assert store.claim("other",now=now+4) is None
     assert store.get_scan("scan-key","tenant","sub")["status"]=="failed"
+
+
+def test_worker_logs_heartbeat_database_error_and_recovers(store,caplog):
+    original_heartbeat=store.heartbeat
+    recovered=threading.Event()
+    calls=0
+
+    def flaky_heartbeat(job):
+        nonlocal calls
+        calls+=1
+        if calls==1:
+            raise OSError("private DSN must not be logged")
+        renewed=original_heartbeat(job)
+        if renewed:recovered.set()
+        return renewed
+
+    store.heartbeat=flaky_heartbeat
+    submit(store,"heartbeat-retry")
+    caplog.set_level(logging.INFO,"wellar.worker")
+    worker=Worker(store,"heartbeat-retry-worker",lambda _payload: (
+        {"status":"done"} if recovered.wait(2) else pytest.fail("heartbeat did not recover")))
+
+    assert worker.run_once()
+    assert store.get_result("scan-heartbeat-retry","tenant","sub")["status"]=="done"
+    events=[record for record in caplog.records if hasattr(record,"event_fields")]
+    failed=next(record for record in events if record.msg=="scan.processing.heartbeat.failed")
+    recovered_event=next(record for record in events if record.msg=="scan.processing.heartbeat.recovered")
+    assert failed.event_fields["error_code"]=="lease_heartbeat_error"
+    assert failed.event_fields["exception_type"]=="OSError"
+    assert "private DSN" not in caplog.text
+    assert recovered_event.event_fields["recovered_after_failures"]==1
+
+
+def test_worker_does_not_commit_or_clean_up_after_heartbeat_rejection(store,caplog):
+    original_heartbeat=store.heartbeat
+    heartbeat_checked=threading.Event()
+    claimed={}
+    original_claim=store.claim
+
+    def capture_claim(worker_id,now=None):
+        job=original_claim(worker_id,now=now)
+        if job:claimed.update(job)
+        return job
+
+    def reject_expired_heartbeat(job):
+        store.db.execute("UPDATE jobs SET lease_until=? WHERE job_id=?",(time.time()-1,job["job_id"]))
+        renewed=original_heartbeat(job)
+        heartbeat_checked.set()
+        return renewed
+
+    store.claim=capture_claim
+    store.heartbeat=reject_expired_heartbeat
+    reference="media://tenant/0123456789abcdef"
+    submitted,_=submit(store,"heartbeat-rejected",body=json.dumps({"media_refs":[reference]}))
+    caplog.set_level(logging.WARNING,"wellar.worker")
+    class Media:
+        def __init__(self):self.deleted=[]
+        def delete(self,ref,tenant_id,subject_id):self.deleted.append((ref,tenant_id,subject_id));return True
+    class Processor:
+        def __init__(self):self.media_store=Media()
+        def __call__(self,_payload):
+            if not heartbeat_checked.wait(2):pytest.fail("heartbeat was not checked")
+            return {"status":"stale-result"}
+    processor=Processor()
+    worker=Worker(store,"heartbeat-rejected-worker",processor)
+
+    assert worker.run_once()
+    assert store.get_result(submitted["scan_id"],"tenant","sub") is None
+    assert store.get_scan(submitted["scan_id"],"tenant","sub")["status"]=="processing"
+    assert processor.media_store.deleted==[]
+    assert next(record for record in caplog.records if record.msg=="scan.processing.heartbeat.rejected")
+    assert next(record for record in caplog.records if record.msg=="scan.processing.lease_lost")
+
+    recovered=original_claim("heartbeat-recovery-worker",now=claimed["lease_until"]+0.01)
+    assert recovered and recovered["fencing_token"]>claimed["fencing_token"]
+    store.complete(recovered,{"status":"recovered-result"})
+    assert store.get_result(submitted["scan_id"],"tenant","sub")["status"]=="recovered-result"
+
+
+def test_worker_does_not_clean_media_when_heartbeat_errors_and_lease_expires(store):
+    store.heartbeat=lambda _job: (_ for _ in ()).throw(OSError("database unavailable"))
+    reference="media://tenant/abcdef0123456789"
+    submit(store,"heartbeat-error-expiry",body=json.dumps({"media_refs":[reference]}))
+
+    class Media:
+        def __init__(self):self.deleted=[]
+        def delete(self,ref,tenant_id,subject_id):self.deleted.append((ref,tenant_id,subject_id));return True
+    class Processor:
+        def __init__(self):self.media_store=Media()
+        def __call__(self,_payload):
+            time.sleep(1.1)
+            raise ValueError("invalid analysis input")
+
+    processor=Processor()
+    assert Worker(store,"heartbeat-error-expiry-worker",processor).run_once()
+    assert processor.media_store.deleted==[]
+    assert store.get_scan("scan-heartbeat-error-expiry","tenant","sub")["status"]=="processing"
 
 
 def test_result_and_outbox_are_atomic_and_idempotent(store):

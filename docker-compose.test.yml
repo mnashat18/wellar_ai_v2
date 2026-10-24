@@ -2,13 +2,13 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: wellar_test
-      POSTGRES_DB: wellar_test
+      POSTGRES_USER: wellar_sprint08
+      POSTGRES_DB: wellar_v2_sprint08_test
       POSTGRES_PASSWORD: ${V2_TEST_POSTGRES_PASSWORD:?set a disposable local test password}
     ports:
       - "127.0.0.1:55432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U wellar_test -d wellar_test"]
+      test: ["CMD-SHELL", "pg_isready -U wellar_sprint08 -d wellar_v2_sprint08_test"]
       interval: 3s
       timeout: 2s
       retries: 20

@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from app.core.adapters import create_analysis_processor
+from app.core.config import Settings
 from app.media.analysis import MultimodalFeatureProcessor
 from app.ml.artifact_guard import ModelActivationDenied
 from app.ml.feature_mapping import FEATURE_MAPPING_VERSION
@@ -90,6 +92,21 @@ def _payload():
         "_media_manifest": [{"media_ref": "media://fixture/0123456789abcdef", "modality": "video"}],
         "_worker_context": {"scan_id": "scan-synthetic", "tenant_id": "tenant-secret-fixture", "subject_id": "subject-secret-fixture"},
     }
+
+
+def test_analysis_processor_only_enables_guarded_configured_artifacts(tmp_path):
+    disabled=create_analysis_processor(Settings(),_MediaStore())
+    assert disabled.prediction_enabled is False
+    assert all(predictor.__class__.__name__=="DisabledPredictor" for predictor in disabled.predictors.values())
+
+    # This fixture exercises loader wiring only; it is not a real or approved model.
+    _test_release(tmp_path)
+    enabled=create_analysis_processor(Settings(model_inference_enabled=True,model_artifact_dir=str(tmp_path)),_MediaStore())
+    assert enabled.prediction_enabled is True
+    assert enabled.predictors[TARGET].__class__.__name__!="DisabledPredictor"
+
+    with pytest.raises(ModelActivationDenied):
+        create_analysis_processor(Settings(model_inference_enabled=True,model_artifact_dir=str(tmp_path/"missing")),_MediaStore())
 
 
 def test_stage_one_does_not_invoke_even_an_injected_predictor(tmp_path, monkeypatch):
