@@ -55,11 +55,11 @@ def postgres_store():
     if (
         parsed.scheme not in {"postgres", "postgresql"}
         or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
-        or parsed.port != 55432
+        or parsed.port != 55433
         or parsed.path.lstrip("/") != "wellar_v2_sprint08_test"
         or parsed.username != "wellar_sprint08"
     ):
-        pytest.fail("refusing database integration unless DSN targets only the Sprint 08 loopback test database on port 55432")
+        pytest.fail("refusing database integration unless DSN targets only the Sprint 08 loopback test database on port 55433")
     schema="wellar_test_"+uuid4().hex
     with isolated_connect(dsn) as conn:conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
     store=isolated_store(dsn,capacity=100,max_attempts=2,lease_seconds=1,retry_base_seconds=.01,max_pool_size=12,schema=schema)
