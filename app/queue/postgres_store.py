@@ -273,7 +273,11 @@ class PostgresQueueStore:
                 try:result=json.loads(result)
                 except ValueError:continue
             indicator=result.get("evidence",{}).get("drowsiness_indicator",{}) if isinstance(result,dict) else {}
-            if indicator.get("status")=="available":history.append({"measurements":indicator.get("raw_measurements",{}),"created_at":row["created_at"].timestamp()})
+            if (indicator.get("engine_type")=="rule_based_indicators"
+                    and indicator.get("analysis_status")=="prediction_available"):
+                history.append({"measurements":indicator.get("raw_measurements",{}),
+                    "created_at":row["created_at"].timestamp(),"status":indicator.get("analysis_status"),
+                    "engine_type":indicator.get("engine_type"),"engine_version":indicator.get("model_version")})
         return history
 
     def register_media(self,*,media_id,tenant_id,subject_id,modality,content_type,size_bytes,sha256,relative_path,max_total_bytes,max_tenant_bytes):

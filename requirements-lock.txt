@@ -41,7 +41,7 @@ mediapipe==0.10.21
 ml_dtypes==0.5.4
 msgpack==1.2.3
 numpy==1.26.4
-opencv-contrib-python==4.10.0.84
+opencv-contrib-python-headless==4.10.0.84
 opentelemetry-api==1.45.1
 opt_einsum==3.4.0
 packageurl-python==0.17.6

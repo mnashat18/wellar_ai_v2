@@ -15,14 +15,12 @@ def test_kss_consent_off_does_not_retain_label_or_features(client, auth, store):
     scan_id = completed_scan(client, auth, store, "kss-off")
     result = client.get(f"/api/v1/scans/{scan_id}/result", headers=auth).json()
     indicator = result["drowsiness_indicator"]
-    # Media analysis intentionally does not run the legacy indicator when no
-    # validated fatigue model is active; the safe result is explicit abstention.
-    assert indicator["status"] == "not_performed"
-    assert indicator["scope"] == "media_feature_extraction_only"
-    assert indicator["production_prediction"] is False
-    assert "state" not in indicator and "level" not in indicator
-    assert "confidence" not in indicator and "accuracy" not in indicator
-    assert "label" not in indicator
+    # A missing video is terminal retake evidence; consent still cannot retain KSS.
+    assert indicator["analysis_status"] == "retake_required"
+    assert indicator["prediction"] is None
+    assert indicator["insufficient_evidence_reason"] == "video_not_provided"
+    assert indicator["engine_type"] == "rule_based_indicators"
+    assert result["analysis_status"] == "retake_required"
     response = client.post(f"/api/v1/scans/{scan_id}/labels/kss", headers=auth, json={"kss": 8, "training_consent": False})
     assert response.status_code == 202
     assert response.json()["label_status"] == "not_retained"

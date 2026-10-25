@@ -174,7 +174,7 @@ def attach_kss_label(scan_id: str, payload: KSSLabelSubmission, request: Request
     evidence=result.get("evidence",{}) if isinstance(result,dict) else {}
     modalities=evidence.get("modalities",{}) if isinstance(evidence,dict) else {}
     features={}
-    allowed={"short_clip_eye_closure_fraction","blink_rate_per_minute","closure_duration_mean_seconds","closure_duration_max_seconds","face_coverage","mean_sampled_luminance","mean_blur_variance","eye_aspect_ratio","laplacian_variance","gray_mean"}
+    allowed={"short_clip_eye_closure_fraction","blink_rate_per_minute","closure_duration_mean_seconds","closure_duration_max_seconds","face_coverage","mean_sampled_luminance","mean_blur_variance","eye_aspect_ratio","laplacian_variance","gray_mean","perclos_p80","blink_count","mean_blink_duration_seconds","microsleep_count","prolonged_eye_closure_count","yawn_count","head_nod_count","gaze_variability","head_pose_variability","face_detection_ratio","temporal_coverage","frame_count_decoded"}
     for modality in ("video","image"):
         envelope=modalities.get(modality,{})
         values=envelope.get("features",{}) if isinstance(envelope,dict) else {}

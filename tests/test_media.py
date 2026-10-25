@@ -174,7 +174,39 @@ def test_combined_image_video_audio_result_is_versioned_and_abstains(client,auth
     assert result["evidence"]["fusion"]["status"]=="inactive_no_validated_release"
     assert result["evidence"]["research_model_compatibility"]["fatigue"]["status"]=="abstained"
     assert result["evidence"]["research_model_compatibility"]["vigilance"]["status"]=="abstained"
-    assert result["drowsiness_indicator"]["status"]=="not_performed"
+    assert result["drowsiness_indicator"]["analysis_status"]=="retake_required"
+    assert result["drowsiness_indicator"]["insufficient_evidence_reason"]=="no_usable_face_data"
+    assert result["drowsiness_indicator"]["prediction"] is None
+
+
+def test_synthetic_rule_engine_prediction_is_preserved_by_scan_api(client,auth,tmp_path,monkeypatch):
+    """Synthetic API contract check only; not evidence of prediction quality."""
+    video_ref=upload(client,"video",video_file(tmp_path/"synthetic-rule.avi"),"video/x-msvideo").json()["media_ref"]
+    def synthetic_decode(_target,args,**_kwargs):
+        modality=args[0]
+        assert modality=="video"
+        return {"status":"available","quality":{"overall_coverage":0.95,"missingness":0.05,"reason":None},
+            "features":{"face_detection_ratio":1.0,"mean_luminance":80.0,"mean_sampled_luminance":80.0,
+                "mean_blur_variance":45.0,"observation_count":32,"overall_coverage":0.95,
+                "video_duration_seconds":5.0,
+                "perclos_p80":0.16,"blink_rate_per_minute":12.0,"microsleep_count":0,
+                "prolonged_eye_closure_count":0,"yawn_count":0,"head_nod_count":0,
+                "gaze_variability":0.01,"head_pose_variability":0.01},
+            "timing_ms":{"total":1.0},"provenance":{"extractor":"opencv_decode_mediapipe_face_mesh_eye_mouth_geometry","version":"synthetic-test"}}
+    monkeypatch.setattr("app.media.analysis.run_killable",synthetic_decode)
+    accepted=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"synthetic-rule-contract"},json={
+        "schema_version":"1.0","media_refs":[video_ref],"reaction_task":None,"consent":CONSENT,
+    })
+    assert accepted.status_code==202
+    assert Worker(client.app.state.store,"synthetic-rule-worker",client.app.state.worker_processor).run_once()
+    result=client.get(f"/api/v1/scans/{accepted.json()['scan_id']}/result",headers=auth).json()
+    assert result["analysis_status"]=="prediction_available"
+    assert result["prediction"]=="elevated_fatigue"
+    assert result["risk_level"]=="elevated_fatigue"
+    assert result["engine_type"]=="rule_based_indicators"
+    assert result["drowsiness_indicator"]["prediction"]==result["prediction"]
+    assert result["drowsiness_indicator"]["confidence_level"]==result["confidence_level"]
+    assert result["model_invocation_status"]=="not_invoked_no_validated_model"
     assert all(target["value"] is None for target in result["targets"].values())
     assert result["prediction_extension"]["inference_status"]=="disabled"
     assert result["measurements"]["fatigue"]["status"]=="unavailable"

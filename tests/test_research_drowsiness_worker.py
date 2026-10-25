@@ -57,7 +57,9 @@ def test_stage_one_never_invokes_research_image_classifier(monkeypatch):
     try:
         assert classifier.calls == 0
         assert "research_model_inference" not in result["evidence"]
-        assert result["drowsiness_indicator"]["status"] == "not_performed"
+        assert result["drowsiness_indicator"]["analysis_status"] == "retake_required"
+        assert result["drowsiness_indicator"]["prediction"] is None
+        assert result["drowsiness_indicator"]["insufficient_evidence_reason"] == "video_not_provided"
         assert result["prediction_extension"]["targets"]["reference_sleepiness"]["status"] == "unavailable"
         assert result["prediction_extension"]["targets"]["subjective_fatigue"]["status"] == "unavailable"
         assert result["prediction_extension"]["targets"]["vigilance_impairment"]["status"] == "unavailable"

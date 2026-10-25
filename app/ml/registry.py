@@ -76,6 +76,10 @@ def load_predictors(*, enabled: bool = False, artifact_dir: str | Path | None = 
         feature_names = tuple(getattr(predictor, "feature_names", ()))
         if not feature_names or any(name not in SUPPORTED_FEATURES for name in feature_names):
             raise ModelActivationDenied("model release uses an unsupported feature schema")
+        feature_modalities = {name.split(".", 1)[0] for name in feature_names}
+        manifest_modalities = set(manifest["required_modalities"])
+        if feature_modalities != manifest_modalities:
+            raise ModelActivationDenied("model release modalities do not match its feature schema")
         predictors[target] = predictor
     if all(isinstance(predictor, DisabledPredictor) for predictor in predictors.values()):
         raise ModelActivationDenied("inference is enabled but no model release artifacts are present")

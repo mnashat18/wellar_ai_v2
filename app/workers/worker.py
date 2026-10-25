@@ -14,6 +14,8 @@ from app.observability.metrics import worker_metrics
 from app.drowsiness_indicator import classify as classify_drowsiness
 from app.measurements.dual_output import dual_measurement_output
 from app.behavioral.engine import build_behavioral_evidence
+from app.media.contracts import PredictionExtension, VersionedTargetPrediction
+from app.ml.runtime import TARGETS
 from app.media.reconciliation import MediaReconciler,delete_with_retry
 
 logger=logging.getLogger("wellar.worker")
@@ -31,9 +33,14 @@ def research_only_processor(payload: dict) -> dict:
             "collection_consent": True,
         }
     measurements=dual_measurement_output(None, legacy_reference=legacy_reference)
+    prediction_extension=PredictionExtension(inference_status="disabled",targets={
+        target:VersionedTargetPrediction(status="unavailable",quality_status="not_evaluated",
+            abstention_reason="prediction_not_enabled") for target in sorted(TARGETS)
+    })
     return {
         "status": "insufficient_evidence",
         "model_version": None,
+        "prediction_extension": prediction_extension.model_dump(mode="json"),
         "targets": {
             "reference_sleepiness": {"status":"unavailable","value":None},
             "vigilance_impairment": {"status":"unavailable","value":None},
@@ -42,7 +49,7 @@ def research_only_processor(payload: dict) -> dict:
         "behavioral_evidence": build_behavioral_evidence({}, measurements),
         "drowsiness_indicator": classify_drowsiness({}),
         "quality": {"video":"not_processed","image":"not_processed","audio":"not_processed","reaction_task":"not_provided"},
-        "message": "No authorized, validated analysis pipeline is configured.",
+        "message": "Media processing completed; model inference is disabled, so no prediction was performed.",
     }
 
 

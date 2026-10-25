@@ -1,0 +1,49 @@
+{
+  "schema_version": "wellar.rule-based-indicators/1.0",
+  "version": "1.0.1",
+  "engine_type": "rule_based_indicators",
+  "window_seconds": 30,
+  "minimum_video_duration_seconds": 2.0,
+  "p80_pupil_coverage": 0.8,
+  "minimum_face_detection_ratio": 0.5,
+  "minimum_temporal_coverage": 0.7,
+  "minimum_samples": 8,
+  "minimum_luminance": 20.0,
+  "minimum_blur_variance": 10.0,
+  "blink_min_seconds": 0.1,
+  "blink_max_seconds": 0.5,
+  "microsleep_min_seconds_exclusive": 0.5,
+  "yawn_mouth_aspect_ratio": 0.55,
+  "yawn_min_seconds": 0.2,
+  "yawn_max_seconds": 3.0,
+  "head_nod_pitch_excursion": 0.12,
+  "head_nod_min_seconds": 0.5,
+  "maximum_observation_gap_seconds_minimum": 0.25,
+  "maximum_observation_gap_sample_periods": 1.5,
+  "baseline_valid_scans": 3,
+  "baseline_perclos_deviation": 0.1,
+  "baseline_blink_rate_deviation_per_minute": 10.0,
+  "confidence": {
+    "high_quality_minimum": 0.9,
+    "medium_quality_minimum": 0.75,
+    "high_indicator_count_minimum": 2,
+    "medium_indicator_count_minimum": 1
+  },
+  "class_rules": {
+    "high_risk": {
+      "microsleep_count_at_least": 1,
+      "perclos_p80_at_least": 0.4
+    },
+    "elevated_fatigue": {
+      "perclos_p80_at_least": 0.15,
+      "prolonged_eye_closure_count_at_least": 6,
+      "yawn_count_at_least": 2
+    },
+    "low_focus": {
+      "perclos_p80_at_least": 0.11,
+      "blink_rate_per_minute_at_least": 25.0,
+      "head_nod_count_at_least": 1
+    }
+  },
+  "priority": ["high_risk", "elevated_fatigue", "low_focus", "stable"]
+}

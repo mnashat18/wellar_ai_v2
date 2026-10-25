@@ -143,12 +143,44 @@ def test_default_processor_has_three_disabled_null_targets_and_legacy_contract(t
     assert all(value["status"] == "unavailable" and value["value"] is None for value in extension["targets"].values())
     assert result["schema_version"] == "2.0"
     assert result["status"] == "insufficient_evidence"
-    assert result["model_version"] is None
+    assert result["model_version"] == "rule-based-indicators/1.0.1"
+    assert result["engine_type"] == "rule_based_indicators"
+    assert result["message"] == "Media processing completed; model inference is disabled, so no prediction was performed."
     assert result["targets"] == {
         "reference_sleepiness": {"status": "unavailable", "value": None, "reason": "model_unavailable"},
         "vigilance_impairment": {"status": "unavailable", "value": None, "reason": "model_unavailable"},
     }
     ScanResult.model_validate(result)
+
+
+def test_synthetic_fixture_exercises_enabled_inference_wiring_only(tmp_path, monkeypatch):
+    # This is a synthetic wiring check, not evidence of model quality or validation.
+    _test_release(tmp_path)
+    predictors = load_predictors(enabled=True, artifact_dir=tmp_path)
+    processor = _processor(predictors, monkeypatch)
+    processor.prediction_enabled = True
+
+    result = processor(_payload())
+
+    extension = result["prediction_extension"]
+    target = extension["targets"][TARGET]
+    assert extension["inference_status"] == "partial"
+    assert target["status"] == "available"
+    assert target["value"] in {0, 1}
+    assert "target predictions are available" in result["message"] or "only some targets" in result["message"]
+    assert result["status"] == "insufficient_evidence"
+    assert "stable" not in result["message"].lower()
+
+
+def test_manifest_modalities_must_match_artifact_feature_schema(tmp_path):
+    _test_release(tmp_path)
+    manifest_path = tmp_path / f"{TARGET}.manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["required_modalities"] = ["audio"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ModelActivationDenied, match="modalities do not match"):
+        load_predictors(enabled=True, artifact_dir=tmp_path)
 
 
 def test_worker_evidence_versions_media_pipe_provenance_and_stage_timing(monkeypatch):

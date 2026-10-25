@@ -24,6 +24,10 @@ def test_submit_worker_result_and_tenant_access(client,auth,store):
     result=client.get(f"/api/v1/scans/{sid}/result",headers=auth)
     assert result.status_code==200
     assert result.json()["status"]=="insufficient_evidence"
+    assert result.json()["prediction_extension"]["inference_status"]=="disabled"
+    assert all(target["status"]=="unavailable" and target["value"] is None
+               for target in result.json()["prediction_extension"]["targets"].values())
+    assert "no prediction was performed" in result.json()["message"]
     assert result.json()["targets"]["reference_sleepiness"]["value"] is None
     assert result.json()["measurements"]["schema_version"]=="wellar.dual-measurements/1.0"
     assert result.json()["measurements"]["fatigue"]["status"]=="unavailable"

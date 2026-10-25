@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.middleware import RequestContextMiddleware
 from app.api.v1 import router, directus_process
@@ -22,30 +23,50 @@ from app.queue.sqlite_store import sqlite_error_details
 from app.security.auth import DevelopmentAuthenticator, DirectusAuthenticator, JWTAuthenticator
 from app.security.rate_limit import TenantRateLimiter
 from app.drowsiness_indicator import load_thresholds
+from app.rule_based_indicators import load_config as load_rule_indicator_config
 from app.compat.directus_facade import DirectusHTTPClient, DirectusPullProcessor
 
 logger=logging.getLogger("wellar.app")
+
+
+def _verify_extractor_import() -> bool:
+    import cv2
+    import mediapipe
+    from app.media import extractors
+    return bool(cv2.__version__ and mediapipe.__version__ and extractors._face_mesh_factory)
 
 
 def create_app(settings: Settings | None=None, store=None, authenticator=None) -> FastAPI:
     settings=settings or Settings.from_env()
     settings.validate()
     load_thresholds()  # Reject an invalid indicator contract before serving traffic.
+    load_rule_indicator_config()  # Reject a malformed frozen rule-engine config before serving traffic.
     configure_logging(settings.log_level,settings.environment)
     owns_store=store is None
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        if app.state.store is None:
-            app.state.store = create_queue_store(settings)
-        if app.state.store.readiness() is not True:
-            raise RuntimeError("storage readiness check failed")
-        app.state.media_store=create_media_store(settings,app.state.store)
-        delegate=create_analysis_processor(settings,app.state.media_store)
-        app.state.worker_processor=(DirectusPullProcessor(DirectusHTTPClient(settings.directus_url,settings.directus_service_token,timeout=settings.directus_timeout_seconds),app.state.media_store,delegate) if settings.directus_pull_enabled else delegate)
-        app.state.ready=True
-        event(logger,"application.started",processing_stage="startup")
-        try: yield
+    async def initialized_lifespan(app: FastAPI):
+        try:
+            if app.state.store is None:
+                app.state.store = create_queue_store(settings)
+            if app.state.store.readiness() is not True:
+                if settings.queue_backend == "postgres":
+                    raise RuntimeError("PostgreSQL queue schema is not ready; run `python -m app.queue.migrate up`")
+                raise RuntimeError("Queue database readiness check failed")
+            app.state.media_store=create_media_store(settings,app.state.store)
+            if settings.media_backend == "s3" and not app.state.media_store.readiness():
+                raise RuntimeError("S3 bucket is not accessible; verify bucket name, endpoint, credentials and bucket permissions")
+            try:
+                app.state.extractor_ready = _verify_extractor_import()
+            except Exception:
+                raise RuntimeError("Media extractor runtime could not import OpenCV and MediaPipe") from None
+            if not app.state.extractor_ready:
+                raise RuntimeError("Media extractor runtime could not import OpenCV and MediaPipe")
+            delegate=create_analysis_processor(settings,app.state.media_store)
+            app.state.worker_processor=(DirectusPullProcessor(DirectusHTTPClient(settings.directus_url,settings.directus_service_token,timeout=settings.directus_timeout_seconds),app.state.media_store,delegate) if settings.directus_pull_enabled else delegate)
+            app.state.ready=True
+            event(logger,"application.started",processing_stage="startup")
+            yield
         finally:
             app.state.ready=False
             if getattr(app.state,"worker_processor",None) is not None: app.state.worker_processor.close()
@@ -53,10 +74,10 @@ def create_app(settings: Settings | None=None, store=None, authenticator=None) -
                 media_store=app.state.media_store
                 if hasattr(media_store,"aclose"): await media_store.aclose()
                 elif hasattr(media_store,"close"): media_store.close()
-            if owns_store: app.state.store.close()
+            if owns_store and app.state.store is not None: app.state.store.close()
             event(logger,"application.stopped",processing_stage="shutdown")
 
-    app=FastAPI(title="Wellar AI V2",version="0.1.0",lifespan=lifespan)
+    app=FastAPI(title="Wellar AI V2",version="0.1.0",lifespan=initialized_lifespan)
     app.state.settings=settings
     app.state.store=store
     app.state.media_store=None
@@ -67,14 +88,16 @@ def create_app(settings: Settings | None=None, store=None, authenticator=None) -
         app.state.authenticator=DirectusAuthenticator(base_url=settings.directus_url,timeout=settings.directus_timeout_seconds)
     else: app.state.authenticator=DevelopmentAuthenticator(settings.dev_auth_tokens or {})
     app.state.ready=False
+    app.state.rule_config_ready=True
+    app.state.extractor_ready=False
     app.state.metrics=BoundedMetrics()
     app.state.directus_pull_enabled=settings.directus_pull_enabled
-    try:
-        rate_limit_per_minute=int(__import__("os").getenv("WELLAR_RATE_LIMIT_PER_MINUTE","120"))
-    except ValueError as exc:
-        raise ValueError("WELLAR_RATE_LIMIT_PER_MINUTE must be a positive integer") from exc
-    app.state.rate_limiter=TenantRateLimiter(rate_limit_per_minute)
+    app.state.rate_limiter=TenantRateLimiter(settings.rate_limit_per_minute)
     app.add_middleware(RequestContextMiddleware)
+    if settings.cors_origins:
+        app.add_middleware(CORSMiddleware,allow_origins=list(settings.cors_origins),
+            allow_methods=["GET","POST","DELETE","OPTIONS"],allow_headers=["Authorization","Content-Type","Idempotency-Key"],
+            allow_credentials=False,max_age=600)
     app.include_router(router)
     app.add_api_route("/process", directus_process, methods=["POST"], status_code=202)
 
@@ -155,7 +178,13 @@ def create_app(settings: Settings | None=None, store=None, authenticator=None) -
         except Exception: storage_ok=False
         try: media_ok=app.state.media_store is not None and app.state.media_store.readiness()
         except Exception: media_ok=False
-        dependencies={"queue":bool(storage_ok),"media_storage":bool(media_ok)}
+        try:
+            load_rule_indicator_config()
+            rule_config_ok=True
+        except Exception:
+            rule_config_ok=False
+        dependencies={"queue":bool(storage_ok),"media_storage":bool(media_ok),
+            "rule_config":rule_config_ok,"extractor_import":bool(app.state.extractor_ready)}
         if not app.state.ready or not all(dependencies.values()):
             return JSONResponse(status_code=503,content={"status":"not_ready","dependencies":dependencies,"queue":queue_diagnostics})
         return {"status":"ready","dependencies":dependencies,"queue":queue_diagnostics}
