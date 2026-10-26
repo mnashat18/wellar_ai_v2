@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import uuid
 from typing import Protocol
+
+CONFIDENCE_LEVEL_TO_NUMBER={"low":0.3,"medium":0.6,"high":0.9}
 
 
 @dataclass(frozen=True)
@@ -57,17 +60,64 @@ def build_directus_v2_result_contract_v1(result: dict, directus_scan_id: str) ->
         risk="stable"
     contributors=indicator.get("contributing_indicators",[])
     message=result.get("message","")
+    level=indicator.get("confidence_level") if isinstance(indicator,dict) else None
+    # This is a categorical level, not a calibrated probability.
+    confidence=CONFIDENCE_LEVEL_TO_NUMBER.get(level) if isinstance(level,str) else None
     explanation="; ".join([*(str(item) for item in contributors if isinstance(item,str)),
+                            f"Confidence level: {level}" if isinstance(level,str) else "",
                             message if isinstance(message,str) else ""])
     baseline=indicator.get("baseline") if isinstance(indicator,dict) else None
     raw=indicator.get("raw_measurements") if isinstance(indicator,dict) else None
-    return {"scan_id":directus_scan_id,"risk_level":risk,"confidence":indicator.get("confidence_level"),
+    return validate_scan_result_payload({"scan_id":directus_scan_id,"risk_level":risk,"confidence":confidence,
             "explanation":explanation or "Indicative, non-diagnostic result.",
             "suggested_action":{"stable":"Continue routine monitoring.","low_focus":"Consider a short break.",
                 "elevated_fatigue":"Take a break before continuing.","high_risk":"Stop the activity and rest."}[risk],
             "ai_model_version":indicator.get("model_version"),
             "baseline_used":bool(baseline.get("used")) if isinstance(baseline,dict) else False,
-            "face_metrics":raw if isinstance(raw,dict) else None,"readiness_score":None}
+            "face_metrics":raw if isinstance(raw,dict) else None,"readiness_score":None})
+
+
+NUMERIC_MAX=99999.99999
+NUMERIC_FIELDS=("readiness_score","confidence","camera_confidence","voice_confidence","confidence_drift")
+JSON_OBJECT_FIELDS=("face_metrics","voice_metrics","reaction_metrics")
+
+
+class InvalidDirectusPayload(ValueError):
+    error_code="directus_invalid_payload"
+    retryable=False
+
+
+def validate_scan_result_payload(payload: dict) -> dict:
+    """Validate and normalize values against Directus scan_results column types."""
+    if not isinstance(payload,dict): raise InvalidDirectusPayload("directus_invalid_payload")
+    result=dict(payload)
+    try: uuid.UUID(result.get("scan_id"))
+    except (ValueError,TypeError,AttributeError): raise InvalidDirectusPayload("directus_invalid_payload") from None
+    for field in ("risk_level","explanation","suggested_action"):
+        if field in result and result[field] is not None and not isinstance(result[field],str):
+            raise InvalidDirectusPayload("directus_invalid_payload")
+    for field in NUMERIC_FIELDS:
+        value=result.get(field)
+        if value is not None and (isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or abs(value)>NUMERIC_MAX):
+            raise InvalidDirectusPayload("directus_invalid_payload")
+    value=result.get("task_performance_score")
+    if value is not None and (isinstance(value,bool) or not isinstance(value,int)): raise InvalidDirectusPayload("directus_invalid_payload")
+    value=result.get("internal_analysis")
+    if value is not None and not isinstance(value,str): raise InvalidDirectusPayload("directus_invalid_payload")
+    if isinstance(value,str) and len(value)>255: result["internal_analysis"]=None
+    value=result.get("ai_model_version")
+    if value is not None and (not isinstance(value,str) or len(value)>255): raise InvalidDirectusPayload("directus_invalid_payload")
+    value=result.get("baseline_used")
+    if value is not None and not isinstance(value,bool): raise InvalidDirectusPayload("directus_invalid_payload")
+    def safe_json(item):
+        if isinstance(item,float) and not math.isfinite(item): return False
+        if isinstance(item,dict): return all(isinstance(key,str) and safe_json(child) for key,child in item.items())
+        if isinstance(item,list): return all(safe_json(child) for child in item)
+        return item is None or isinstance(item,(str,int,float,bool))
+    for field in JSON_OBJECT_FIELDS:
+        value=result.get(field)
+        if value is not None and (not isinstance(value,dict) or not safe_json(value)): raise InvalidDirectusPayload("directus_invalid_payload")
+    return result
 
 
 def _validate_safe_result(event: dict) -> bool:
@@ -98,8 +148,8 @@ class DirectusOutboxPublisher:
         if not safe_event:
             self.store.fail_directus_outbox(event["event_id"],publisher_id,event["fencing_token"],
                 "unsafe_result_contract",max_attempts=self.max_attempts,
-                retry_base_seconds=self.retry_base_seconds)
-            return "retry_scheduled"
+                retry_base_seconds=self.retry_base_seconds,permanent=True)
+            return "failed"
         sync_event={key:value for key,value in event.items() if key!="result_json"}
         sync_event["v2_result_payload"]=(build_directus_v2_result_contract_v1(event["result_json"],event["directus_scan_id"])
             if event["event_type"]=="scan.completed" else None)
@@ -108,12 +158,13 @@ class DirectusOutboxPublisher:
         except Exception as exc:
             category=getattr(exc,"error_code",None)
             safe_codes={"directus_unavailable","directus_timeout","directus_forbidden",
-                        "directus_schema_mismatch","remote_state_mismatch","unsafe_result_contract"}
+                        "directus_schema_mismatch","remote_state_mismatch","unsafe_result_contract","directus_invalid_payload"}
             code=category if category in safe_codes else "directus_sync_failed"
+            permanent=getattr(exc,"retryable",True) is False or category=="directus_invalid_payload"
             retried=self.store.fail_directus_outbox(event["event_id"],publisher_id,
                 event["fencing_token"],code,max_attempts=self.max_attempts,
-                retry_base_seconds=self.retry_base_seconds)
-            return "retry_scheduled" if retried else "stale_lease"
+                retry_base_seconds=self.retry_base_seconds,permanent=permanent)
+            return ("failed" if permanent else "retry_scheduled") if retried else "stale_lease"
         if not isinstance(remote,VerifiedDirectusState):
             remote=VerifiedDirectusState("","","invalid")
         expected_status="completed" if event["event_type"]=="scan.completed" else "failed"

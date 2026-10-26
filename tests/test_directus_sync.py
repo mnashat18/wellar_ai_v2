@@ -17,6 +17,10 @@ from app.security.auth import Principal
 from app.compat.directus_facade import DirectusResultWriter
 
 
+DIRECTUS_SCAN_ID = "00000000-0000-4000-8000-000000000001"
+OTHER_DIRECTUS_SCAN_ID = "00000000-0000-4000-8000-000000000002"
+
+
 def result(scan_id):
     return {"schema_version":"2.0","scan_id":scan_id,"status":"insufficient_evidence",
             "message":"Inference is disabled.","drowsiness_indicator":{"risk_level":"high_risk",
@@ -34,7 +38,7 @@ def completed_store(tmp_path, suffix="one"):
     return store,scan_id
 
 
-def evidence(scan_id, directus_id="directus-1", **changes):
+def evidence(scan_id, directus_id=DIRECTUS_SCAN_ID, **changes):
     base=dict(scan_id=scan_id,directus_scan_id=directus_id,tenant_id="tenant-a",subject_id="subject-a",
               remote_owner_id="subject-a",remote_tenant_id="tenant-a",remote_status="media_ready",
               membership_active=True,media_owner_verified=True,verified_at=time.time())
@@ -86,17 +90,17 @@ def test_binding_is_durable_unique_and_tenant_subject_scoped(tmp_path):
         proof=evidence(scan_id)
         assert store.bind_directus_scan(proof) is True
         assert store.bind_directus_scan(proof) is False
-        assert store.get_directus_binding(scan_id,"tenant-a","subject-a")["directus_scan_id"]=="directus-1"
+        assert store.get_directus_binding(scan_id,"tenant-a","subject-a")["directus_scan_id"]==DIRECTUS_SCAN_ID
         assert store.get_directus_binding(scan_id,"tenant-b","subject-a") is None
         with pytest.raises(ValueError,match="different Directus binding"):
-            store.bind_directus_scan(evidence(scan_id,"directus-other"))
+            store.bind_directus_scan(evidence(scan_id,OTHER_DIRECTUS_SCAN_ID))
         other_scan="v2-two"
         payload="{}"
         store.submit(other_scan,Principal("subject-a","tenant-a"),"key-two",hashlib.sha256(payload.encode()).hexdigest(),payload)
         other_job=store.claim("worker-two")
         store.complete(other_job,result(other_scan))
         with pytest.raises(ValueError,match="already bound"):
-            store.bind_directus_scan(evidence(other_scan,"directus-1"))
+            store.bind_directus_scan(evidence(other_scan,DIRECTUS_SCAN_ID))
     finally:
         store.close()
 
@@ -120,7 +124,7 @@ def test_unbound_completion_is_not_claimed_and_binding_releases_durable_event(tm
         store.bind_directus_scan(evidence(scan_id))
         claimed=store.claim_directus_outbox("publisher")
         assert claimed["scan_id"]==scan_id
-        assert claimed["directus_scan_id"]=="directus-1"
+        assert claimed["directus_scan_id"]==DIRECTUS_SCAN_ID
         assert claimed["result_json"]["status"]=="insufficient_evidence"
         assert claimed["result_json"]["drowsiness_indicator"]["risk_level"]=="high_risk"
     finally:
@@ -138,7 +142,7 @@ def test_binding_and_pending_sync_survive_local_process_restart(tmp_path):
         assert binding["verification_version"]=="directus-binding-v1"
         assert binding["media_owner_verified"]==1
         event=restarted.claim_directus_outbox("after-restart")
-        assert event["directus_scan_id"]=="directus-1"
+        assert event["directus_scan_id"]==DIRECTUS_SCAN_ID
     finally:
         restarted.close()
 
@@ -168,8 +172,8 @@ def test_expired_publisher_lease_fences_stale_ack_and_allows_recovery(tmp_path):
         first=store.claim_directus_outbox("old",lease_seconds=1,now=instant)
         second=store.claim_directus_outbox("new",lease_seconds=2,now=instant+2)
         assert second["fencing_token"]==first["fencing_token"]+1
-        assert not store.ack_directus_outbox(first["event_id"],"old",first["fencing_token"],"directus-1","completed","directus-1",now=instant+2)
-        assert store.ack_directus_outbox(second["event_id"],"new",second["fencing_token"],"directus-1","completed","directus-1",now=instant+2)
+        assert not store.ack_directus_outbox(first["event_id"],"old",first["fencing_token"],DIRECTUS_SCAN_ID,"completed",DIRECTUS_SCAN_ID,now=instant+2)
+        assert store.ack_directus_outbox(second["event_id"],"new",second["fencing_token"],DIRECTUS_SCAN_ID,"completed",DIRECTUS_SCAN_ID,now=instant+2)
     finally:
         store.close()
 
@@ -238,7 +242,11 @@ def test_publisher_rejects_malformed_result_before_remote_write(tmp_path):
         store.bind_directus_scan(evidence(scan_id))
         remote=IdempotentRemote()
         publisher=DirectusOutboxPublisher(store,remote,retry_base_seconds=.001)
-        assert publisher.run_once("publisher")=="retry_scheduled"
+        assert publisher.run_once("publisher")=="failed"
+        assert remote.calls==0
+        row=store.db.execute("SELECT delivery_status,attempts FROM outbox").fetchone()
+        assert row["delivery_status"]=="dead" and row["attempts"]==1
+        assert publisher.run_once("publisher")=="idle"
         assert remote.calls==0
     finally:
         store.close()
@@ -257,7 +265,7 @@ def test_terminal_failure_is_transactionally_queued_and_verified(tmp_path):
         class FailureRemote:
             def ensure_synced(self,event):
                 assert event["event_type"]=="scan.failed" and event["v2_result_payload"] is None
-                return VerifiedDirectusState("directus-1",None,"failed")
+                return VerifiedDirectusState(DIRECTUS_SCAN_ID,None,"failed")
         publisher=DirectusOutboxPublisher(store,FailureRemote())
         assert publisher.run_once("publisher")=="delivered"
     finally:
@@ -298,16 +306,54 @@ def test_remote_identity_or_state_mismatch_is_never_acknowledged(tmp_path):
 
 def test_directus_contract_maps_indicator_even_when_inference_is_disabled():
     source=result("v2-contract")
-    payload=build_directus_v2_result_contract_v1(source,"directus-scan")
-    assert payload["scan_id"]=="directus-scan"
+    import uuid
+    directus_scan_id=str(uuid.uuid4())
+    payload=build_directus_v2_result_contract_v1(source,directus_scan_id)
+    assert payload["scan_id"]==directus_scan_id
     assert payload["risk_level"]=="high_risk"
-    assert payload["confidence"]=="low"
-    assert payload["explanation"]=="eye_closure; Inference is disabled."
+    assert payload["confidence"]==0.3
+    assert payload["explanation"]=="eye_closure; Confidence level: low; Inference is disabled."
     assert payload["suggested_action"]=="Stop the activity and rest."
     assert payload["ai_model_version"]=="rules-v1"
     assert payload["baseline_used"] is True
     assert payload["face_metrics"]=={"perclos":0.4}
     assert payload["readiness_score"] is None
+
+
+def test_real_v2_sample_payload_values_match_scan_results_column_types():
+    import uuid
+    from app.integrations.directus_sync import NUMERIC_FIELDS, JSON_OBJECT_FIELDS, validate_scan_result_payload
+    source=result(str(uuid.uuid4()))
+    source["drowsiness_indicator"]["risk_level"]="stable"
+    source["drowsiness_indicator"]["baseline"]["used"]=False
+    payload=build_directus_v2_result_contract_v1(source,str(uuid.uuid4()))
+    assert payload["confidence"]==0.3
+    assert validate_scan_result_payload(payload)==payload
+    for field in NUMERIC_FIELDS:
+        value=payload.get(field)
+        assert value is None or (isinstance(value,(int,float)) and not isinstance(value,bool) and abs(value)<=99999.99999)
+    assert payload.get("task_performance_score") is None
+    internal_analysis=payload.get("internal_analysis")
+    assert internal_analysis is None or (isinstance(internal_analysis,str) and len(internal_analysis)<=255)
+    assert isinstance(payload["ai_model_version"],str) and len(payload["ai_model_version"])<=255
+    assert isinstance(payload["baseline_used"],bool) and payload["baseline_used"] is False
+    assert all(payload.get(field) is None or isinstance(payload[field],dict) for field in JSON_OBJECT_FIELDS)
+    def finite_json(value):
+        import math
+        if isinstance(value,float): return math.isfinite(value)
+        if isinstance(value,dict): return all(finite_json(child) for child in value.values())
+        if isinstance(value,list): return all(finite_json(child) for child in value)
+        return True
+    assert all(finite_json(payload[field]) for field in JSON_OBJECT_FIELDS if isinstance(payload.get(field),dict))
+    assert payload["scan_id"]==str(uuid.UUID(payload["scan_id"]))
+    assert "Confidence level: low" in payload["explanation"]
+    unknown_source={**source,"drowsiness_indicator":{**source["drowsiness_indicator"],"confidence_level":"unknown"}}
+    unknown_payload=build_directus_v2_result_contract_v1(unknown_source,str(uuid.uuid4()))
+    assert unknown_payload["confidence"] is None
+    assert validate_scan_result_payload(unknown_payload)==unknown_payload
+    oversized_internal={**unknown_payload,"internal_analysis":"{"+"x"*300+"}"}
+    normalized=validate_scan_result_payload(oversized_internal)
+    assert normalized["internal_analysis"] is None
 
 
 def test_result_writer_upserts_same_directus_row_on_repeated_delivery():
@@ -321,8 +367,10 @@ def test_result_writer_upserts_same_directus_row_on_repeated_delivery():
         def get_scan(self,scan_id): return {"id":scan_id,"status":self.status}
         def existing_result(self,scan_id): return self.row
     remote=Remote(); writer=DirectusResultWriter(remote)
-    event={"event_type":"scan.completed","directus_scan_id":"directus-scan",
-           "v2_result_payload":{"scan_id":"directus-scan","risk_level":"stable"}}
-    assert writer.ensure_synced(event)==VerifiedDirectusState("directus-scan","directus-scan","completed")
-    assert writer.ensure_synced(event)==VerifiedDirectusState("directus-scan","directus-scan","completed")
+    import uuid
+    directus_scan_id=str(uuid.uuid4())
+    event={"event_type":"scan.completed","directus_scan_id":directus_scan_id,
+           "v2_result_payload":{"scan_id":directus_scan_id,"risk_level":"stable"}}
+    assert writer.ensure_synced(event)==VerifiedDirectusState(directus_scan_id,directus_scan_id,"completed")
+    assert writer.ensure_synced(event)==VerifiedDirectusState(directus_scan_id,directus_scan_id,"completed")
     assert remote.creates==1 and remote.updates==1

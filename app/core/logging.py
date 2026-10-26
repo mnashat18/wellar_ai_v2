@@ -42,7 +42,7 @@ class JsonFormatter(logging.Formatter):
             "request_id": _pseudonym(request_id_var.get()),
             "trace_id": format(active_context.trace_id,"032x") if active_context.is_valid else trace_id_var.get(),
         }
-        allowed = {"scan_id", "job_id", "worker_id", "processing_stage", "duration_ms", "duration_clock", "error_code", "exception_type", "model_version", "status_code", "attempt", "attempt_count", "modality", "size_bytes", "tenant_ref", "item_count", "operation", "sqlite_error_code", "sqlite_error_name", "retry_attempt_count", "transaction_duration_ms", "busy_lock_count", "endpoint_name", "directus_error_code", "field_names"}
+        allowed = {"scan_id", "job_id", "worker_id", "processing_stage", "duration_ms", "duration_clock", "error_code", "exception_type", "model_version", "status_code", "attempt", "attempt_count", "modality", "size_bytes", "tenant_ref", "item_count", "operation", "sqlite_error_code", "sqlite_error_name", "retry_attempt_count", "transaction_duration_ms", "busy_lock_count", "endpoint_name", "directus_error_code", "directus_error_message", "field_names"}
         for key, value in fields.items():
             if key in allowed and value is not None:
                 if isinstance(value, str):

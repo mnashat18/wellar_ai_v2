@@ -198,14 +198,14 @@ class PostgresQueueStore:
                 (instant,event_id,publisher_id,fencing_token,instant,directus_scan_id,directus_scan_id,remote_result_scan_id,remote_status,remote_result_scan_id,remote_status)).fetchone()
             return row is not None
 
-    def fail_directus_outbox(self,event_id,publisher_id,fencing_token,error_code,*,max_attempts=8,retry_base_seconds=1,now=None):
-        allowed={"directus_unavailable","directus_timeout","directus_forbidden","directus_schema_mismatch","remote_state_mismatch","unsafe_result_contract","directus_sync_failed"}
+    def fail_directus_outbox(self,event_id,publisher_id,fencing_token,error_code,*,max_attempts=8,retry_base_seconds=1,now=None,permanent=False):
+        allowed={"directus_unavailable","directus_timeout","directus_forbidden","directus_schema_mismatch","remote_state_mismatch","unsafe_result_contract","directus_sync_failed","directus_invalid_payload"}
         code=error_code if error_code in allowed else "directus_sync_failed"
         instant=datetime.fromtimestamp(now,timezone.utc) if now is not None else datetime.now(timezone.utc)
         with self.pool.connection() as conn,conn.transaction():
             row=conn.execute("SELECT attempts FROM outbox WHERE event_id=%s AND delivery_status='running' AND publisher_id=%s AND fencing_token=%s AND lease_until>=%s FOR UPDATE",(event_id,publisher_id,fencing_token,instant)).fetchone()
             if not row:return False
-            dead=row["attempts"]>=max_attempts
+            dead=permanent or row["attempts"]>=max_attempts
             if not 0<retry_base_seconds<=60 or not 1<=max_attempts<=12: raise ValueError("publisher retry limits are invalid")
             delay=min(300,retry_base_seconds*(2**min(8,max(0,row["attempts"]-1))))
             conn.execute("UPDATE outbox SET delivery_status=%s,available_at=%s,lease_until=NULL,publisher_id=NULL,last_error_code=%s WHERE event_id=%s",("dead" if dead else "pending",instant+timedelta(seconds=delay),code,event_id))
