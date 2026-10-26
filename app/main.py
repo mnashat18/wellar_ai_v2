@@ -75,6 +75,8 @@ def create_app(settings: Settings | None=None, store=None, authenticator=None) -
                 if hasattr(media_store,"aclose"): await media_store.aclose()
                 elif hasattr(media_store,"close"): media_store.close()
             if owns_store and app.state.store is not None: app.state.store.close()
+            directus_client=getattr(app.state,"directus_client",None)
+            if callable(getattr(directus_client,"close",None)):directus_client.close()
             event(logger,"application.stopped",processing_stage="shutdown")
 
     app=FastAPI(title="Wellar AI V2",version="0.1.0",lifespan=initialized_lifespan)
@@ -92,6 +94,8 @@ def create_app(settings: Settings | None=None, store=None, authenticator=None) -
     app.state.extractor_ready=False
     app.state.metrics=BoundedMetrics()
     app.state.directus_pull_enabled=settings.directus_pull_enabled
+    app.state.directus_client=(DirectusHTTPClient(settings.directus_url,settings.directus_service_token,timeout=settings.directus_timeout_seconds)
+        if settings.directus_url and settings.directus_service_token else None)
     app.state.rate_limiter=TenantRateLimiter(settings.rate_limit_per_minute)
     app.add_middleware(RequestContextMiddleware)
     if settings.cors_origins:

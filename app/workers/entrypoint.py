@@ -13,7 +13,8 @@ from app.core.config import Settings
 from app.core.logging import configure_logging,event
 from app.core.adapters import create_analysis_processor,create_media_store,create_queue_store
 from app.workers.worker import Worker
-from app.compat.directus_facade import DirectusHTTPClient,DirectusPullProcessor
+from app.compat.directus_facade import DirectusHTTPClient,DirectusPullProcessor,DirectusResultWriter
+from app.integrations.directus_sync import DirectusOutboxPublisher
 from app.rule_based_indicators import load_config as load_rule_indicator_config
 
 
@@ -29,7 +30,7 @@ def main() -> None:
     stop=threading.Event()
     for sig in (signal.SIGINT,signal.SIGTERM): signal.signal(sig,lambda *_: stop.set())
 
-    store=media_store=processor=None
+    store=media_store=processor=directus_client=None
     worker_id=f"worker-{uuid.uuid4()}"
     ready_path=readiness_marker_path()
     ready_path.unlink(missing_ok=True)
@@ -47,9 +48,14 @@ def main() -> None:
         # Stage 1 runs media feature extraction only; no prediction artifacts load.
         processor=create_analysis_processor(settings,media_store)
         processor.warmup()
+        if settings.directus_url and settings.directus_service_token:
+            directus_client=DirectusHTTPClient(settings.directus_url,settings.directus_service_token,timeout=settings.directus_timeout_seconds)
         if settings.directus_pull_enabled:
-            processor=DirectusPullProcessor(DirectusHTTPClient(settings.directus_url,settings.directus_service_token,timeout=settings.directus_timeout_seconds),media_store,processor)
+            processor=DirectusPullProcessor(directus_client,media_store,processor)
+        publisher=(DirectusOutboxPublisher(store,DirectusResultWriter(directus_client))
+                   if directus_client is not None else None)
         worker=Worker(store,worker_id,processor,
+            directus_publisher=publisher,
             reconciliation_page_size=settings.media_reconciliation_page_size,
             reconciliation_max_pages=settings.media_reconciliation_max_pages,
             reconciliation_max_references=settings.media_reconciliation_max_references,
@@ -78,6 +84,9 @@ def main() -> None:
         if media_store is not None:
             try:media_store.close()
             except Exception as exc:event(logger,"worker.media_store.close_failed",logging.ERROR,processing_stage="shutdown",error_code="worker_close_failed",exception_type=type(exc).__name__)
+        if directus_client is not None and not settings.directus_pull_enabled:
+            try:directus_client.close()
+            except Exception as exc:event(logger,"worker.directus_client.close_failed",logging.ERROR,processing_stage="shutdown",error_code="directus_client_close_failed",exception_type=type(exc).__name__)
         if store is not None:
             try:store.close()
             except Exception as exc:event(logger,"worker.queue_store.close_failed",logging.ERROR,processing_stage="shutdown",error_code="worker_close_failed",exception_type=type(exc).__name__)

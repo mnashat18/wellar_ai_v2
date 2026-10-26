@@ -86,6 +86,31 @@ def test_idempotent_replay_and_opaque_media_validation(client,auth):
     assert invalid.status_code==422
 
 
+def test_directus_scan_is_verified_and_bound_to_the_v2_job(client,auth,store):
+    class Directus:
+        def get_scan(self,scan_id):
+            return {"id":scan_id,"user":"user-a","business_profile":"tenant-a","status":"pending"}
+        def verify_active_membership(self,user_id,tenant_id): return True
+    client.app.state.directus_client=Directus()
+    response=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"directus-bind"},
+                         json={**BODY,"directus_scan_id":"directus-scan-1"})
+    assert response.status_code==202
+    binding=store.get_directus_binding(response.json()["scan_id"],"tenant-a","user-a")
+    assert binding["directus_scan_id"]=="directus-scan-1"
+
+
+def test_directus_scan_with_wrong_owner_is_rejected_before_queue_acceptance(client,auth,store):
+    class Directus:
+        def get_scan(self,scan_id):
+            return {"id":scan_id,"user":"someone-else","business_profile":"tenant-a","status":"pending"}
+        def verify_active_membership(self,user_id,tenant_id): return True
+    client.app.state.directus_client=Directus()
+    response=client.post("/api/v1/scans",headers={**auth,"Idempotency-Key":"wrong-directus-owner"},
+                         json={**BODY,"directus_scan_id":"directus-scan-2"})
+    assert response.status_code==403
+    assert store.db.execute("SELECT count(*) FROM scans").fetchone()[0]==0
+
+
 def test_trace_context_does_not_break_idempotent_submission(client,auth):
     headers={**auth,"Idempotency-Key":"trace-replay"}
     first=client.post("/api/v1/scans",headers={**headers,"traceparent":"00-11111111111111111111111111111111-2222222222222222-01"},json=BODY)

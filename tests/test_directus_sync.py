@@ -14,16 +14,14 @@ from app.integrations.directus_sync import (
 )
 from app.queue.sqlite_store import SQLiteQueueStore
 from app.security.auth import Principal
+from app.compat.directus_facade import DirectusResultWriter
 
 
 def result(scan_id):
     return {"schema_version":"2.0","scan_id":scan_id,"status":"insufficient_evidence",
-            "targets":{"reference_sleepiness":{"value":None,"status":"unavailable"},
-                       "vigilance_impairment":{"value":None,"status":"unavailable"}},
-            "prediction_extension":{"schema_version":"1.0","inference_status":"disabled",
-              "targets":{"reference_sleepiness":{"value":None,"status":"unavailable"},
-                         "subjective_fatigue":{"value":None,"status":"unavailable"},
-                         "vigilance_impairment":{"value":None,"status":"unavailable"}}}}
+            "message":"Inference is disabled.","drowsiness_indicator":{"risk_level":"high_risk",
+            "confidence_level":"low","model_version":"rules-v1","contributing_indicators":["eye_closure"],
+            "baseline":{"used":True},"raw_measurements":{"perclos":0.4}}}
 
 
 def completed_store(tmp_path, suffix="one"):
@@ -54,8 +52,8 @@ class IdempotentRemote:
         self.calls+=1
         assert "result_json" not in event
         if event["event_type"]=="scan.completed":
-            assert event["v2_result_payload"]["analysis_status"]=="insufficient_evidence"
-            assert all(target["value"] is None for target in event["v2_result_payload"]["targets"].values())
+            assert event["v2_result_payload"]["risk_level"]=="high_risk"
+            assert event["v2_result_payload"]["scan_id"]==event["directus_scan_id"]
         remote_id=event["directus_scan_id"]
         self.records[remote_id]={"status":"completed","result_scan_id":remote_id}
         if self.lose_first_response and self.calls==1:
@@ -103,6 +101,18 @@ def test_binding_is_durable_unique_and_tenant_subject_scoped(tmp_path):
         store.close()
 
 
+def test_pending_directus_scan_can_be_bound_without_claiming_media_verification(tmp_path):
+    store,scan_id=completed_store(tmp_path)
+    try:
+        proof=evidence(scan_id,remote_status="pending",media_owner_verified=False)
+        assert store.bind_directus_scan(proof) is True
+        binding=store.get_directus_binding(scan_id,"tenant-a","subject-a")
+        assert binding["remote_scan_status"]=="pending"
+        assert binding["media_owner_verified"] in (False,0)
+    finally:
+        store.close()
+
+
 def test_unbound_completion_is_not_claimed_and_binding_releases_durable_event(tmp_path):
     store,scan_id=completed_store(tmp_path)
     try:
@@ -112,7 +122,7 @@ def test_unbound_completion_is_not_claimed_and_binding_releases_durable_event(tm
         assert claimed["scan_id"]==scan_id
         assert claimed["directus_scan_id"]=="directus-1"
         assert claimed["result_json"]["status"]=="insufficient_evidence"
-        assert all(target["value"] is None for target in claimed["result_json"]["targets"].values())
+        assert claimed["result_json"]["drowsiness_indicator"]["risk_level"]=="high_risk"
     finally:
         store.close()
 
@@ -221,7 +231,7 @@ def test_rejected_least_privilege_directus_writer_credential_fails_closed(tmp_pa
         store.close()
 
 
-def test_publisher_rejects_numeric_scientific_result_before_remote_write(tmp_path):
+def test_publisher_rejects_malformed_result_before_remote_write(tmp_path):
     store,scan_id=completed_store(tmp_path)
     try:
         store.db.execute("UPDATE results SET result_json=?",(json.dumps({"scan_id":scan_id,"status":"completed","targets":{"reference_sleepiness":{"value":0.1}}}),))
@@ -286,19 +296,33 @@ def test_remote_identity_or_state_mismatch_is_never_acknowledged(tmp_path):
         store.close()
 
 
-def test_proposed_directus_contract_preserves_abstention_without_legacy_scores():
+def test_directus_contract_maps_indicator_even_when_inference_is_disabled():
     source=result("v2-contract")
-    source["prediction_extension"]={"schema_version":"1.0","inference_status":"disabled",
-      "targets":{"reference_sleepiness":{"status":"unavailable","value":None,"private_feature":"filtered"},
-                 "subjective_fatigue":{"status":"unavailable","value":None},
-                 "vigilance_impairment":{"status":"unavailable","value":None}}}
-    payload=build_directus_v2_result_contract_v1(source)
-    assert payload["contract_version"]=="wellar.directus.v2-result/1"
-    assert payload["processing_status"]=="completed"
-    assert payload["analysis_status"]=="insufficient_evidence"
-    assert all(target["value"] is None for target in payload["targets"].values())
-    assert payload["targets"]["reference_sleepiness"]["abstention_reason"]=="prediction_disabled_unvalidated_model"
-    assert "private_feature" not in payload["targets"]["reference_sleepiness"]
-    assert not {"readiness_score","risk_level","observed_fatigue_score"}.intersection(payload)
-    source["prediction_extension"]["targets"]["reference_sleepiness"]["value"]=0.99
-    with pytest.raises(ValueError): build_directus_v2_result_contract_v1(source)
+    payload=build_directus_v2_result_contract_v1(source,"directus-scan")
+    assert payload["scan_id"]=="directus-scan"
+    assert payload["risk_level"]=="high_risk"
+    assert payload["confidence"]=="low"
+    assert payload["explanation"]=="eye_closure; Inference is disabled."
+    assert payload["suggested_action"]=="Stop the activity and rest."
+    assert payload["ai_model_version"]=="rules-v1"
+    assert payload["baseline_used"] is True
+    assert payload["face_metrics"]=={"perclos":0.4}
+    assert payload["readiness_score"] is None
+
+
+def test_result_writer_upserts_same_directus_row_on_repeated_delivery():
+    class Remote:
+        def __init__(self): self.row=None; self.status="pending"; self.creates=0; self.updates=0
+        def write_v2_result(self,scan_id,payload):
+            if self.row is None:self.creates+=1
+            else:self.updates+=1
+            self.row={"id":"result-row","scan_id":scan_id,**payload}
+        def set_scan_status(self,scan_id,status,failure_reason=None): self.status=status
+        def get_scan(self,scan_id): return {"id":scan_id,"status":self.status}
+        def existing_result(self,scan_id): return self.row
+    remote=Remote(); writer=DirectusResultWriter(remote)
+    event={"event_type":"scan.completed","directus_scan_id":"directus-scan",
+           "v2_result_payload":{"scan_id":"directus-scan","risk_level":"stable"}}
+    assert writer.ensure_synced(event)==VerifiedDirectusState("directus-scan","directus-scan","completed")
+    assert writer.ensure_synced(event)==VerifiedDirectusState("directus-scan","directus-scan","completed")
+    assert remote.creates==1 and remote.updates==1

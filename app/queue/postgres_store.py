@@ -50,9 +50,9 @@ class PostgresQueueStore:
             conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
             applied={row["version"] for row in conn.execute("SELECT version FROM schema_migrations").fetchall()}
             root=Path(__file__).resolve().parents[2]/"deployment"/"migrations"
-            for version in (1,2,3,4,5):
+            for version in (1,2,3,4,5,6):
                 if version not in applied:
-                    name={1:"initial",2:"directus_sync",3:"training_labels",4:"label_lifecycle",5:"media_reconciliation_checkpoint"}[version]
+                    name={1:"initial",2:"directus_sync",3:"training_labels",4:"label_lifecycle",5:"media_reconciliation_checkpoint",6:"pending_directus_bindings"}[version]
                     conn.execute((root/f"{version:03d}_{name}.up.sql").read_text(encoding="utf-8"))
                     conn.execute("INSERT INTO schema_migrations(version) VALUES(%s)",(version,))
 
@@ -60,7 +60,7 @@ class PostgresQueueStore:
         with self.pool.connection() as conn,conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(728193441)")
             if conn.execute("SELECT to_regclass('schema_migrations') AS table_name").fetchone()["table_name"] is None:return
-            for version,name in ((5,"media_reconciliation_checkpoint"),(4,"label_lifecycle"),(3,"training_labels"),(2,"directus_sync"),(1,"initial")):
+            for version,name in ((6,"pending_directus_bindings"),(5,"media_reconciliation_checkpoint"),(4,"label_lifecycle"),(3,"training_labels"),(2,"directus_sync"),(1,"initial")):
                 if conn.execute("SELECT 1 FROM schema_migrations WHERE version=%s",(version,)).fetchone():
                     root=Path(__file__).resolve().parents[2]/"deployment"/"migrations"
                     conn.execute((root/f"{version:03d}_{name}.down.sql").read_text(encoding="utf-8"))
@@ -146,7 +146,7 @@ class PostgresQueueStore:
                 if old:
                     if tuple(old.values())==(directus_scan_id,tenant_id,subject_id): return False
                     raise ValueError("V2 scan already has a different Directus binding")
-                conn.execute("INSERT INTO directus_scan_bindings(scan_id,directus_scan_id,tenant_id,subject_id,remote_owner_id,remote_tenant_id,remote_scan_status,membership_active,media_owner_verified,verification_version,verified_at) VALUES(%s,%s,%s,%s,%s,%s,%s,true,true,'directus-binding-v1',%s)",(scan_id,directus_scan_id,tenant_id,subject_id,evidence.remote_owner_id,evidence.remote_tenant_id,evidence.remote_status,instant))
+                conn.execute("INSERT INTO directus_scan_bindings(scan_id,directus_scan_id,tenant_id,subject_id,remote_owner_id,remote_tenant_id,remote_scan_status,membership_active,media_owner_verified,verification_version,verified_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'directus-binding-v1',%s)",(scan_id,directus_scan_id,tenant_id,subject_id,evidence.remote_owner_id,evidence.remote_tenant_id,evidence.remote_status,evidence.membership_active,evidence.media_owner_verified,instant))
                 return True
         except UniqueViolation:
             raise ValueError("Directus scan is already bound to another V2 scan") from None
@@ -229,7 +229,7 @@ class PostgresQueueStore:
             else:
                 conn.execute("UPDATE scans SET status=%s,updated_at=%s WHERE scan_id=%s",(status,instant,job["scan_id"]))
             if terminal:
-                conn.execute("INSERT INTO outbox(event_id,scan_id,event_type,payload_json) VALUES(%s,%s,'scan.failed',%s::jsonb) ON CONFLICT(scan_id,event_type) DO NOTHING",(new_id(),job["scan_id"],json.dumps({"scan_id":job["scan_id"]})))
+                conn.execute("INSERT INTO outbox(event_id,scan_id,event_type,payload_json) VALUES(%s,%s,'scan.failed',%s::jsonb) ON CONFLICT(scan_id,event_type) DO NOTHING",(new_id(),job["scan_id"],json.dumps({"scan_id":job["scan_id"],"error_code":error_code[:80]})))
         event(logger,"queue.postgres.retry_scheduled" if status=="queued" else "queue.postgres.terminal_failure",logging.WARNING if status=="queued" else logging.ERROR,processing_stage="queue_retry",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=job["worker_id"],duration_ms=round((time.perf_counter()-started)*1000,3),error_code=error_code[:80])
         worker_metrics.increment("queue","retry_scheduled" if status=="queued" else "terminal_failure")
 
