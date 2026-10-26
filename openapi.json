@@ -656,6 +656,19 @@
               }
             ]
           },
+            "directus_scan_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Directus Scan Id"
+            },
           "media_refs": {
             "items": {
               "type": "string"

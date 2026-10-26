@@ -104,6 +104,18 @@ class DirectusHTTPClient:
         if response.status_code != 200: _raise_response(response,"directus_scan_not_found",allow_not_found=False)
         return response.json().get("data", {})
 
+    def verify_active_membership(self, user_id: str, tenant_id: str) -> bool:
+        response=self._request("GET","/items/business_profile_members",params={
+            "filter[user][_eq]":user_id,"filter[business_profile][_eq]":tenant_id,
+            "filter[status][_eq]":"active","fields":"id,user,business_profile,status","limit":"2"})
+        if response.status_code!=200:_raise_response(response,"directus_schema_mismatch",allow_not_found=False)
+        rows=response.json().get("data",[])
+        def relation(value):return value.get("id") if isinstance(value,dict) else value
+        return (isinstance(rows,list) and len(rows)==1 and isinstance(rows[0],dict)
+                and relation(rows[0].get("user"))==user_id
+                and relation(rows[0].get("business_profile"))==tenant_id
+                and rows[0].get("status")=="active")
+
     def get_scan_media(self, scan_id: str) -> dict:
         response = self._request("GET", "/items/scan_media", params={"filter[scan_id][_eq]": scan_id, "fields": "scan_id,video_file,audio_file,image_file", "limit": "2"})
         if response.status_code != 200: _raise_response(response,"directus_schema_mismatch",allow_not_found=False)
@@ -164,8 +176,18 @@ class DirectusHTTPClient:
             response=self._request("POST","/items/scan_results",json=body)
         if response.status_code not in {200,201}: _raise_response(response,"directus_schema_mismatch",allow_not_found=False)
 
-    def set_scan_status(self, scan_id: str, status: str) -> None:
-        response=self._request("PATCH",f"/items/wellness_scans/{quote(scan_id,safe='')}",json={"status":status})
+    def write_v2_result(self, scan_id: str, payload: dict) -> None:
+        existing=self.existing_result(scan_id)
+        if existing and existing.get("id") is not None:
+            response=self._request("PATCH",f"/items/scan_results/{quote(str(existing['id']),safe='')}",json=payload)
+        else:
+            response=self._request("POST","/items/scan_results",json=payload)
+        if response.status_code not in {200,201}: _raise_response(response,"directus_schema_mismatch",allow_not_found=False)
+
+    def set_scan_status(self, scan_id: str, status: str, failure_reason: str | None=None) -> None:
+        body={"status":status}
+        if failure_reason is not None:body["failure_reason"]=failure_reason
+        response=self._request("PATCH",f"/items/wellness_scans/{quote(scan_id,safe='')}",json=body)
         if response.status_code not in {200,201}: _raise_response(response,"directus_schema_mismatch",allow_not_found=False)
 
     def delete_file(self, file_id: str) -> bool:
@@ -174,6 +196,26 @@ class DirectusHTTPClient:
 
     def close(self) -> None:
         self.client.close()
+
+
+class DirectusResultWriter:
+    """Adapter used by the durable outbox; delivery can safely be repeated."""
+    def __init__(self,client):self.client=client
+
+    def ensure_synced(self,event):
+        from app.integrations.directus_sync import VerifiedDirectusState
+        directus_id=event["directus_scan_id"]
+        if event["event_type"]=="scan.completed":
+            self.client.write_v2_result(directus_id,event["v2_result_payload"])
+            self.client.set_scan_status(directus_id,"completed")
+        else:
+            reason=(event.get("payload_json") or {}).get("error_code","processing_error")
+            self.client.set_scan_status(directus_id,"failed",str(reason)[:80])
+        scan=self.client.get_scan(directus_id)
+        result=self.client.existing_result(directus_id)
+        relation=result.get("scan_id") if result else None
+        result_scan_id=relation.get("id") if isinstance(relation,dict) else relation
+        return VerifiedDirectusState(directus_id,result_scan_id,scan.get("status",""))
 
 
 class DirectusUnavailable(RuntimeError):

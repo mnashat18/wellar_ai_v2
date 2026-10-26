@@ -34,8 +34,10 @@ class DirectusBindingEvidence:
                      self.remote_owner_id,self.remote_tenant_id)
         if (not all(isinstance(value,str) and value and len(value)<=256 for value in identifiers)
                 or self.remote_owner_id!=self.subject_id or self.remote_tenant_id!=self.tenant_id
-                or self.remote_status!="media_ready" or not self.membership_active
-                or not self.media_owner_verified or not isinstance(self.verified_at,(int,float))
+                or self.remote_status not in {"pending", "media_ready"} or not self.membership_active
+                or not isinstance(self.media_owner_verified,bool)
+                or (not self.media_owner_verified and self.remote_status!="pending")
+                or not isinstance(self.verified_at,(int,float))
                 or not math.isfinite(self.verified_at) or self.verified_at<=0):
             raise ValueError("Directus scan binding evidence is incomplete or inconsistent")
 
@@ -45,50 +47,35 @@ class DirectusWriteAdapter(Protocol):
         """Idempotently write then re-read and verify the bound scan and result."""
 
 
-def build_directus_v2_result_contract_v1(result: dict) -> dict:
-    """Build the proposed additive abstention payload; never maps legacy score fields."""
-    if (not isinstance(result,dict) or result.get("schema_version")!="2.0"
-            or result.get("status") not in {"insufficient_evidence","model_unavailable"}
-            or not isinstance(result.get("scan_id"),str) or not result["scan_id"]):
-        raise ValueError("V2 result is not eligible for the abstention contract")
-    extension=result.get("prediction_extension")
-    targets=extension.get("targets") if isinstance(extension,dict) else None
-    if (not isinstance(extension,dict) or extension.get("inference_status")!="disabled"
-            or result.get("model_version") is not None or not isinstance(targets,dict) or not targets):
-        raise ValueError("V2 target contract is missing")
-    allowed={"reference_sleepiness","subjective_fatigue","vigilance_impairment"}
-    if set(targets)!=allowed or any(not isinstance(target,dict) or target.get("value") is not None
-                                     or target.get("status") not in {"unavailable","abstained"}
-                                     for target in targets.values()):
-        raise ValueError("V2 abstention contract cannot carry predictions")
-    safe_targets={name:{"status":target["status"],"value":None,"confidence":None,
-                        "confidence_calibrated":False,"model_version":None,
-                        "quality_status":target.get("quality_status") if target.get("quality_status") in {"passed","failed","not_evaluated"} else "not_evaluated",
-                        "abstention_reason":"prediction_disabled_unvalidated_model"}
-                  for name,target in targets.items()}
-    return {"contract_version":"wellar.directus.v2-result/1","scan_id":result["scan_id"],
-            "processing_status":"completed","analysis_status":result["status"],
-            "model_version":None,"targets":safe_targets}
+def build_directus_v2_result_contract_v1(result: dict, directus_scan_id: str) -> dict:
+    """Map the displayable V2 indicator into the established Directus result row."""
+    indicator=result.get("drowsiness_indicator") if isinstance(result,dict) else None
+    risk=indicator.get("risk_level") if isinstance(indicator,dict) else None
+    allowed={"stable","low_focus","elevated_fatigue","high_risk"}
+    if risk not in allowed:
+        # An insufficient-quality scan still needs a displayable, non-risk result.
+        risk="stable"
+    contributors=indicator.get("contributing_indicators",[])
+    message=result.get("message","")
+    explanation="; ".join([*(str(item) for item in contributors if isinstance(item,str)),
+                            message if isinstance(message,str) else ""])
+    baseline=indicator.get("baseline") if isinstance(indicator,dict) else None
+    raw=indicator.get("raw_measurements") if isinstance(indicator,dict) else None
+    return {"scan_id":directus_scan_id,"risk_level":risk,"confidence":indicator.get("confidence_level"),
+            "explanation":explanation or "Indicative, non-diagnostic result.",
+            "suggested_action":{"stable":"Continue routine monitoring.","low_focus":"Consider a short break.",
+                "elevated_fatigue":"Take a break before continuing.","high_risk":"Stop the activity and rest."}[risk],
+            "ai_model_version":indicator.get("model_version"),
+            "baseline_used":bool(baseline.get("used")) if isinstance(baseline,dict) else False,
+            "face_metrics":raw if isinstance(raw,dict) else None,"readiness_score":None}
 
 
 def _validate_safe_result(event: dict) -> bool:
     result=event.get("result_json")
     if not isinstance(result,dict) or result.get("scan_id")!=event.get("scan_id"):
         return False
-    if result.get("status") not in {"insufficient_evidence","model_unavailable"}:
-        return False
-    targets=result.get("targets")
-    extension=result.get("prediction_extension")
-    extension_targets=extension.get("targets") if isinstance(extension,dict) else {}
-    required_targets={"reference_sleepiness","subjective_fatigue","vigilance_impairment"}
-    if (not isinstance(targets,dict) or not targets or not isinstance(extension,dict)
-            or extension.get("inference_status")!="disabled" or result.get("model_version") is not None
-            or not isinstance(extension_targets,dict) or set(extension_targets)!=required_targets):
-        return False
-    # The operational V2 model is disabled. Refuse to relay numeric predictions
-    # until a separately approved, scientifically validated sync contract exists.
-    all_targets=list(targets.values())+list(extension_targets.values())
-    return all(isinstance(target,dict) and target.get("value") is None for target in all_targets)
+    indicator=result.get("drowsiness_indicator")
+    return isinstance(indicator,dict) and isinstance(result.get("message"),str)
 
 
 class DirectusOutboxPublisher:
@@ -114,7 +101,7 @@ class DirectusOutboxPublisher:
                 retry_base_seconds=self.retry_base_seconds)
             return "retry_scheduled"
         sync_event={key:value for key,value in event.items() if key!="result_json"}
-        sync_event["v2_result_payload"]=(build_directus_v2_result_contract_v1(event["result_json"])
+        sync_event["v2_result_payload"]=(build_directus_v2_result_contract_v1(event["result_json"],event["directus_scan_id"])
             if event["event_type"]=="scan.completed" else None)
         try:
             remote=self.adapter.ensure_synced(sync_event)
