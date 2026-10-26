@@ -249,11 +249,36 @@ def test_http_mock_server_happy_path_uses_only_ids_and_idempotent_result_write(c
     assert isinstance(stored_analysis,str)
     decoded_analysis=json.loads(stored_analysis)
     assert stored_analysis==json.dumps(decoded_analysis,sort_keys=True,separators=(",",":"))
-    projection=decoded_analysis["projection"]
+    assert len(stored_analysis)<=255
+    assert decoded_analysis=={"details_stored_in":"face_metrics"}
+    decoded_details=remote["results"][0]["face_metrics"]
+    projection=decoded_details["projection"]
     assert all(projection[field] is None for field in ("readiness_score","fatigue_score","focus_score","risk_score","confidence_score"))
-    assert decoded_analysis["deletion_proven"] is True
+    assert decoded_details["deletion_proven"] is True
     assert isinstance(remote["results"][0]["explanation"],str) and remote["results"][0]["explanation"].strip()
     assert len(calls)==1
+
+
+def test_oversized_internal_analysis_is_stored_as_valid_json_without_truncation():
+    written={}
+    def handler(request):
+        if request.method=="GET" and request.url.path=="/items/scan_results":
+            return httpx.Response(200,json={"data":[]})
+        if request.method=="POST" and request.url.path=="/items/scan_results":
+            written.update(json.loads(request.content))
+            return httpx.Response(201,json={"data":{"id":"result-1",**written}})
+        return httpx.Response(404)
+    directus=DirectusHTTPClient("https://directus.test","local-fake-token",transport=httpx.MockTransport(handler))
+    details={"projection":{"explanation":"x"*300},"drowsiness_indicator":{"state":"Elevated Fatigue"}}
+    details_json=json.dumps({**details,"deletion_proven":True},sort_keys=True,separators=(",",":"))
+    assert len(details_json)>255
+
+    directus.write_result(SCAN,{"risk_level":"Elevated Fatigue","internal_analysis":details},True)
+
+    internal_analysis=written["internal_analysis"]
+    assert isinstance(internal_analysis,str) and len(internal_analysis)<=255
+    assert json.loads(internal_analysis)=={"details_stored_in":"face_metrics"}
+    assert written["face_metrics"]=={**details,"deletion_proven":True}
 
 
 def _failure_worker(client,handler):

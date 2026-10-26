@@ -91,11 +91,14 @@ class DirectusHTTPClient:
             raise DirectusUnavailable("directus_timeout") from None
         except httpx.HTTPError:
             raise DirectusUnavailable("directus_unavailable") from None
-        if response.status_code < 200 or response.status_code >= 300:
+        if response.status_code >= 400:
             _log_directus_response(response, path)
         if response.is_redirect:
             raise DirectusUnavailable("directus_redirect_rejected")
         if response.status_code >= 500 or response.status_code == 429:
+            code,_=_directus_error_details(response)
+            if code in {"INVALID_PAYLOAD","INVALID_QUERY","FAILED_VALIDATION"} or "numeric" in response.text.lower():
+                raise DirectusPermanentFailure("directus_invalid_payload")
             raise DirectusUnavailable("directus_unavailable")
         return response
 
@@ -152,6 +155,7 @@ class DirectusHTTPClient:
         return rows[0] if rows else None
 
     def write_result(self, scan_id: str, projection: dict, deletion_proven: bool) -> None:
+        from app.integrations.directus_sync import validate_scan_result_payload
         existing=self.existing_result(scan_id)
         internal=projection.get("internal_analysis")
         if isinstance(internal,str):
@@ -159,6 +163,8 @@ class DirectusHTTPClient:
             except (TypeError,ValueError): internal={"internal_analysis":internal}
         details=dict(internal) if isinstance(internal,dict) else {"projection":projection}
         details["deletion_proven"]=bool(deletion_proven)
+        details_json=json.dumps(details,sort_keys=True,separators=(",",":"),allow_nan=False)
+        details_overflow=len(details_json)>255
         explanation=projection.get("explanation")
         if not isinstance(explanation,str) or not explanation.strip():
             explanation="indicative, non-diagnostic, not a validated classifier"
@@ -169,7 +175,9 @@ class DirectusHTTPClient:
               "ai_model_version":projection.get("ai_model_version"),
               "baseline_used":bool(projection.get("baseline_used",False)),
               "explanation":explanation,
-              "internal_analysis":json.dumps(details,sort_keys=True,separators=(",",":"),allow_nan=False)}
+              "internal_analysis":'{"details_stored_in":"face_metrics"}' if details_overflow else details_json,
+              "face_metrics":details if details_overflow else None}
+        body=validate_scan_result_payload(body)
         if existing and existing.get("id") is not None:
             response=self._request("PATCH",f"/items/scan_results/{quote(str(existing['id']),safe='')}",json=body)
         else:
@@ -177,6 +185,8 @@ class DirectusHTTPClient:
         if response.status_code not in {200,201}: _raise_response(response,"directus_schema_mismatch",allow_not_found=False)
 
     def write_v2_result(self, scan_id: str, payload: dict) -> None:
+        from app.integrations.directus_sync import validate_scan_result_payload
+        payload=validate_scan_result_payload(payload)
         existing=self.existing_result(scan_id)
         if existing and existing.get("id") is not None:
             response=self._request("PATCH",f"/items/scan_results/{quote(str(existing['id']),safe='')}",json=payload)
@@ -258,17 +268,33 @@ def _directus_error_details(response: httpx.Response) -> tuple[str,str]:
     return error_code,",".join(sorted(fields))
 
 
+def _directus_error_message(response: httpx.Response) -> str:
+    try: body=response.json()
+    except (ValueError,UnicodeDecodeError): return ""
+    errors=body.get("errors",[]) if isinstance(body,dict) else []
+    messages=[]
+    for item in errors[:8] if isinstance(errors,list) else []:
+        message=item.get("message") if isinstance(item,dict) else None
+        if isinstance(message,str):
+            message=re.sub(r"(?i)(bearer\s+)[^\s,;]+",r"\1[redacted]",message)
+            message=re.sub(r"(['\"]).*?\1","[redacted]",message)
+            messages.append(message[:160])
+    return " | ".join(messages)[:500]
+
+
 def _log_directus_response(response: httpx.Response, path: str) -> None:
     directus_code,field_names=_directus_error_details(response)
     error_code="directus_validation_error" if response.status_code in {400,422} else "directus_http_error"
     event(logger,"directus.http.error",logging.WARNING,status_code=response.status_code,
           endpoint_name=_endpoint_name(path),error_code=error_code,
-          directus_error_code=directus_code,field_names=field_names)
+          directus_error_code=directus_code,field_names=field_names,
+          directus_error_message=_directus_error_message(response))
 
 
 def _raise_response(response: httpx.Response, fallback: str, *, allow_not_found: bool) -> None:
     status=response.status_code
-    if status in {400,422}:raise DirectusPermanentFailure("directus_validation_error")
+    code,_=_directus_error_details(response)
+    if (400<=status<500 and status!=429) or code in {"INVALID_PAYLOAD","INVALID_QUERY","FAILED_VALIDATION"} or (status>=500 and "numeric" in response.text.lower()):raise DirectusPermanentFailure("directus_invalid_payload")
     if status in {401,403}:raise DirectusPermanentFailure("directus_forbidden")
     if status==404 and not allow_not_found:raise DirectusPermanentFailure(fallback)
     if status>=500 or status==429:raise DirectusUnavailable("directus_unavailable")
@@ -318,6 +344,8 @@ class DirectusPullProcessor:
         remote_result=self.client.existing_result(scan_id)
         if remote_result:
             internal=self._internal_analysis(remote_result.get("internal_analysis"))
+            if internal.get("details_stored_in")=="face_metrics":
+                internal=self._internal_analysis(remote_result.get("face_metrics"))
             self._delete_remote(ids.values())
             existing_projection=internal.get("projection",{})
             self.client.write_result(scan_id,{**existing_projection,"internal_analysis":internal,"risk_level":remote_result.get("risk_level"),"ai_model_version":remote_result.get("ai_model_version"),"baseline_used":remote_result.get("baseline_used",False)},True)

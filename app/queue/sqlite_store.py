@@ -536,8 +536,8 @@ class SQLiteQueueStore:
 
     @_db_operation("fail_directus_outbox", transaction=True)
     def fail_directus_outbox(self, event_id: str, publisher_id: str, fencing_token: int, error_code: str,
-                             *, max_attempts: int=8, retry_base_seconds: float=1, now: float | None=None) -> bool:
-        allowed={"directus_unavailable","directus_timeout","directus_forbidden","directus_schema_mismatch","remote_state_mismatch","unsafe_result_contract","directus_sync_failed"}
+                             *, max_attempts: int=8, retry_base_seconds: float=1, now: float | None=None, permanent: bool=False) -> bool:
+        allowed={"directus_unavailable","directus_timeout","directus_forbidden","directus_schema_mismatch","remote_state_mismatch","unsafe_result_contract","directus_sync_failed","directus_invalid_payload"}
         code=error_code if error_code in allowed else "directus_sync_failed"
         instant=time.time() if now is None else now
         with self._lock:
@@ -549,7 +549,7 @@ class SQLiteQueueStore:
                 if not valid:
                     self.db.execute("COMMIT")
                     return False
-                dead=row["attempts"]>=max_attempts
+                dead=permanent or row["attempts"]>=max_attempts
                 if not 0<retry_base_seconds<=60 or not 1<=max_attempts<=12: raise ValueError("publisher retry limits are invalid")
                 delay=min(300,retry_base_seconds*(2**min(8,max(0,row["attempts"]-1))))
                 self.db.execute("UPDATE outbox SET delivery_status=?,available_at=?,lease_until=NULL,publisher_id=NULL,last_error_code=? WHERE event_id=?",("dead" if dead else "pending",instant+delay,code,event_id))
