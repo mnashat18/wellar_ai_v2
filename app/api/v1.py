@@ -15,6 +15,7 @@ from app.scans.labels import KSSLabelSubmission
 from app.scans.measurements import ClientMeasurements
 from app.drowsiness_indicator import classify as classify_drowsiness, load_thresholds, personal_closure_deviation, fresh_baseline_values
 from app.scans.service import ScanService
+from app.integrations.directus_sync import DirectusBindingEvidence
 from app.security.auth import (AuthenticationProviderUnavailable, DirectusPermissionDenied,
                                DirectusRequestRejected, TenantAuthorizationDenied, Principal, bearer)
 from app.compat.directus_facade import DirectusProcessRequest
@@ -102,6 +103,21 @@ def submit_scan(payload: ScanSubmission, response: Response, request: Request,
         raise HTTPException(422,detail={"code":"duplicate_media_modality","message":"At most one asset per modality is accepted per scan"})
     try:
         scan_payload=payload.model_dump(mode="json")
+        directus_scan_id=scan_payload.get("directus_scan_id")
+        remote=None
+        if directus_scan_id:
+            client=getattr(request.app.state,"directus_client",None)
+            if client is None:
+                raise HTTPException(503,detail={"code":"directus_writeback_unavailable","message":"Directus write-back is not configured","retryable":False})
+            remote=client.get_scan(directus_scan_id)
+            relation=lambda value: value.get("id") if isinstance(value,dict) else value
+            if (relation(remote.get("id"))!=directus_scan_id
+                    or relation(remote.get("user"))!=principal.subject_id
+                    or relation(remote.get("business_profile"))!=principal.tenant_id
+                    or remote.get("status")!="pending"):
+                raise HTTPException(403,detail={"code":"directus_scan_owner_mismatch","message":"Directus scan is not an eligible scan for this user and workspace","retryable":False})
+            if not client.verify_active_membership(principal.subject_id,principal.tenant_id):
+                raise HTTPException(403,detail={"code":"directus_membership_inactive","message":"Active workspace membership could not be verified","retryable":False})
         scan_payload["_media_manifest"]=manifest
         if getattr(request.app.state.store,"shared_monotonic_clock",False):
             scan_payload["_accepted_monotonic"]=time.perf_counter()
@@ -110,6 +126,13 @@ def submit_scan(payload: ScanSubmission, response: Response, request: Request,
             scan_payload["_traceparent"]=traceparent
         queue_submit_started=time.perf_counter()
         record,created=ScanService(request.app.state.store).submit(principal,idempotency_key,scan_payload)
+        if directus_scan_id:
+            request.app.state.store.bind_directus_scan(DirectusBindingEvidence(
+                scan_id=record["scan_id"],directus_scan_id=directus_scan_id,
+                tenant_id=principal.tenant_id,subject_id=principal.subject_id,
+                remote_owner_id=principal.subject_id,remote_tenant_id=principal.tenant_id,
+                remote_status=remote["status"],membership_active=True,media_owner_verified=False,
+                verified_at=time.time()))
         event(logger,"scan.queue.accepted",logging.INFO,processing_stage="queue_acceptance",scan_id=record["scan_id"],duration_ms=round((time.perf_counter()-queue_submit_started)*1000,3),status_code=202)
     except ValueError as exc:
         raise HTTPException(400,detail={"code":"invalid_request","message":str(exc)}) from None
@@ -174,7 +197,7 @@ def attach_kss_label(scan_id: str, payload: KSSLabelSubmission, request: Request
     evidence=result.get("evidence",{}) if isinstance(result,dict) else {}
     modalities=evidence.get("modalities",{}) if isinstance(evidence,dict) else {}
     features={}
-    allowed={"short_clip_eye_closure_fraction","blink_rate_per_minute","closure_duration_mean_seconds","closure_duration_max_seconds","face_coverage","mean_sampled_luminance","mean_blur_variance","eye_aspect_ratio","laplacian_variance","gray_mean"}
+    allowed={"short_clip_eye_closure_fraction","blink_rate_per_minute","closure_duration_mean_seconds","closure_duration_max_seconds","face_coverage","mean_sampled_luminance","mean_blur_variance","eye_aspect_ratio","laplacian_variance","gray_mean","perclos_p80","blink_count","mean_blink_duration_seconds","microsleep_count","prolonged_eye_closure_count","yawn_count","head_nod_count","gaze_variability","head_pose_variability","face_detection_ratio","temporal_coverage","frame_count_decoded"}
     for modality in ("video","image"):
         envelope=modalities.get(modality,{})
         values=envelope.get("features",{}) if isinstance(envelope,dict) else {}

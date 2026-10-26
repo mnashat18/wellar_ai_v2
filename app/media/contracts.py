@@ -1,5 +1,5 @@
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ModalityQuality(BaseModel):
@@ -58,7 +58,7 @@ class AnalysisResult(BaseModel):
     schema_version: Literal["2.0"] = "2.0"
     status: Literal["insufficient_evidence", "model_unavailable"]
     scan_id: str
-    model_version: None = None
+    model_version: str | None = None
     model_invocation_status: Literal["not_invoked_no_validated_model"] = "not_invoked_no_validated_model"
     targets: dict[Literal["reference_sleepiness", "vigilance_impairment"], TargetOutput]
     measurements: dict[str, object] = Field(default_factory=dict)
@@ -67,6 +67,23 @@ class AnalysisResult(BaseModel):
     subjective_reference: dict[str, str | int | bool] | None = None
     evidence: dict[str, object] | None = None
     drowsiness_indicator: dict[str, object] | None = None
+    analysis_status: str = "prediction_unavailable"
+    prediction: Literal["stable", "low_focus", "elevated_fatigue", "high_risk"] | None = None
+    confidence_level: Literal["high", "medium", "low"] | None = None
+    risk_level: Literal["stable", "low_focus", "elevated_fatigue", "high_risk"] | None = None
+    engine_type: Literal["rule_based_indicators"] | None = None
+    contributing_indicators: list[str] = Field(default_factory=list)
+    insufficient_evidence_reason: str | None = None
     features: dict[str, FeatureEnvelope]
     quality: dict[str, str]
     message: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_rule_engine_version(cls, values):
+        if not isinstance(values, dict) or values.get("model_version") is not None:
+            return values
+        indicator = values.get("drowsiness_indicator")
+        if isinstance(indicator, dict) and indicator.get("engine_type") == "rule_based_indicators":
+            values["model_version"] = indicator.get("model_version")
+        return values

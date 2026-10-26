@@ -1,0 +1,2 @@
+ALTER TABLE directus_scan_bindings
+  DROP CONSTRAINT directus_scan_bindings_media_owner_verified_check;

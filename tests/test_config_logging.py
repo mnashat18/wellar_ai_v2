@@ -69,3 +69,28 @@ def test_production_directus_auth_requires_https_and_valid_base_url():
         Settings(environment="production",queue_backend="postgres",postgres_dsn="postgresql://db/test?sslmode=verify-full",media_backend="s3",s3_bucket="private-test",auth_mode="directus",directus_url="http://identity.invalid").validate()
     with pytest.raises(ValueError):
         Settings(environment="test",auth_mode="directus",directus_url="https://user:password@identity.invalid").validate()
+
+
+def _production_settings(**overrides):
+    values=dict(environment="production",queue_backend="postgres",
+        postgres_dsn="postgresql://wellar@db/wellar?sslmode=verify-full",
+        media_backend="s3",s3_bucket="wellar-private",auth_mode="oidc",
+        oidc_issuer="https://identity.invalid/",oidc_audience="wellar-api",
+        oidc_jwks_uri="https://identity.invalid/jwks")
+    values.update(overrides)
+    return Settings(**values)
+
+
+def test_production_keeps_ml_disabled_and_accepts_only_explicit_https_cors_origins():
+    _production_settings(cors_origins=("https://app.example.invalid",)).validate()
+    with pytest.raises(ValueError,match="must remain false"):
+        _production_settings(model_inference_enabled=True,model_artifact_dir="/mounted/artifacts").validate()
+    with pytest.raises(ValueError,match="must use HTTPS"):
+        _production_settings(cors_origins=("http://app.example.invalid",)).validate()
+    with pytest.raises(ValueError,match="without paths or wildcards"):
+        _production_settings(cors_origins=("https://*.example.invalid",)).validate()
+
+
+def test_rate_limit_must_be_positive_and_bounded():
+    with pytest.raises(ValueError,match="WELLAR_RATE_LIMIT_PER_MINUTE"):
+        Settings(rate_limit_per_minute=0).validate()

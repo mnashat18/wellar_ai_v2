@@ -619,7 +619,11 @@ class SQLiteQueueStore:
         for row in rows:
             try:
                 result=json.loads(row["result_json"]); indicator=result.get("evidence",{}).get("drowsiness_indicator",{})
-                if indicator.get("status")=="available": history.append({"measurements":indicator.get("raw_measurements",{}),"created_at":row["created_at"]})
+                if (indicator.get("engine_type")=="rule_based_indicators"
+                        and indicator.get("analysis_status")=="prediction_available"):
+                    history.append({"measurements":indicator.get("raw_measurements",{}),
+                        "created_at":row["created_at"],"status":indicator.get("analysis_status"),
+                        "engine_type":indicator.get("engine_type"),"engine_version":indicator.get("model_version")})
             except (TypeError,ValueError,AttributeError):
                 continue
         return history

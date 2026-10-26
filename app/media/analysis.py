@@ -14,6 +14,7 @@ from app.media.isolated_decode import DecodeChildError,DecodeMemoryLimitError,De
 from app.ml.runtime import TARGETS,PredictionRequest
 from app.ml.feature_mapping import map_features
 from app.ml.research_proxy_adapter import stage1_model_abstentions
+from app.rule_based_indicators import evaluate as evaluate_rule_indicators
 
 logger=logging.getLogger("wellar.media.analysis")
 MODALITIES=("video","image","audio")
@@ -146,7 +147,15 @@ class MultimodalFeatureProcessor:
                 qualities[modality]="invalid_media"
                 features[modality]=FeatureEnvelope(modality=modality,presence="present",extraction_status="invalid_media",quality=ModalityQuality(modality=modality,status="invalid_media",provenance="wellar-v2-media-validator-1.0"),features={"error_code":str(exc)},provenance={"extractor":"wellar-v2-media-validator","version":"1.0"}).model_dump(mode="json")
                 event(logger,"media.modality.invalid",logging.WARNING,processing_stage=f"{modality}_processing",scan_id=scan_id,error_code=str(exc),duration_ms=round((time.perf_counter()-stage)*1000,3),modality=modality,tenant_ref=tenant_ref)
-            except (DecodeTimeoutError,DecodeMemoryLimitError,DecodeChildError):
+            except DecodeTimeoutError:
+                qualities[modality]="failed"
+                features[modality]=FeatureEnvelope(modality=modality,presence="present",extraction_status="failed",quality=ModalityQuality(modality=modality,status="failed",reason="decode_timeout"),features={"error_code":"decode_timeout"},provenance={"extractor":"wellar-v2-isolated-decoder","version":"1.0"}).model_dump(mode="json")
+                event(logger,"media.modality.failed",logging.WARNING,processing_stage=f"{modality}_processing",scan_id=scan_id,error_code="decode_timeout",modality=modality,tenant_ref=tenant_ref)
+            except DecodeMemoryLimitError:
+                qualities[modality]="failed"
+                features[modality]=FeatureEnvelope(modality=modality,presence="present",extraction_status="failed",quality=ModalityQuality(modality=modality,status="failed",reason="decode_memory_limit"),features={"error_code":"decode_memory_limit"},provenance={"extractor":"wellar-v2-isolated-decoder","version":"1.0"}).model_dump(mode="json")
+                event(logger,"media.modality.failed",logging.WARNING,processing_stage=f"{modality}_processing",scan_id=scan_id,error_code="decode_memory_limit",modality=modality,tenant_ref=tenant_ref)
+            except DecodeChildError:
                 raise
             except Exception as exc:
                 qualities[modality]="failed"
@@ -197,6 +206,23 @@ class MultimodalFeatureProcessor:
         else:
             features["reaction_task"]=FeatureEnvelope(modality="reaction_task",presence="missing",extraction_status="not_provided",quality=ModalityQuality(modality="reaction_task",status="not_provided"),features={"missing":True},provenance={}).model_dump(mode="json")
         prediction_extension=self._predict(features)
+        video=features.get("video",{}); video_metrics=video.get("features",{}) if isinstance(video,dict) else {}
+        video_quality=video.get("quality",{}) if isinstance(video,dict) else {}
+        indicator_metrics={
+            **video_metrics,
+            "video_status":video.get("extraction_status","not_provided"),
+            "video_reason":video_quality.get("reason") or video_metrics.get("error_code"),
+            "mean_luminance":video_metrics.get("mean_luminance",video_metrics.get("mean_sampled_luminance")),
+            "frame_count":video_metrics.get("observation_count",video_metrics.get("frame_count_decoded",0)),
+            "temporal_coverage":video_metrics.get("overall_coverage",video_metrics.get("temporal_coverage",0)),
+        }
+        history=[]
+        history_reader=getattr(getattr(self.media_store,"queue_store",None),"get_indicator_history",None)
+        if callable(history_reader) and context.get("subject_id"):
+            try: history=history_reader(context.get("tenant_id",""),context["subject_id"])
+            except Exception: history=[]
+        rule_indicator=evaluate_rule_indicators(indicator_metrics,history=history)
+        rule_indicator["disclaimer"]="Estimated wellness indicator, not medical advice. This rule-based heuristic has not been validated for individual or occupational decisions."
         behavioral_evidence=build_behavioral_evidence(features,measurements)
         modality_evidence={}
         for name in MODALITIES:
@@ -218,11 +244,17 @@ class MultimodalFeatureProcessor:
             model_evidence.append({"name":"MediaPipe Face Mesh","revision":"mediapipe-0.10.21","runtime":"mediapipe.solutions.face_mesh.FaceMesh; CPU XNNPACK","weights":["face_detection_short_range.tflite","face_landmark_with_attention.tflite"],"task":"face landmarks and normalized eye/mouth geometry only","license_id":"Apache-2.0 upstream MediaPipe repository","license_scope_note":"Installed distribution bundles these assets; no asset-specific license metadata was present in the wheel."})
         # Stage 1 ends at descriptive extraction. Do not turn eye/audio features
         # into fatigue states, risk labels, or an indicator score here.
-        drowsiness_indicator={"schema_version":"1.0","status":"not_performed","scope":"media_feature_extraction_only","reason":"fatigue_prediction_not_enabled_in_stage_1","production_prediction":False}
+        drowsiness_indicator=rule_indicator
         evidence={"schema_version":"1.2","scan_id":scan_id,"modalities":modality_evidence,"attention":attention_evidence,"subjective_reference":self_report_evidence,"missing_modalities":absent,"models":model_evidence,"research_model_compatibility":stage1_model_abstentions(features),"fusion":{"status":"inactive_no_validated_release","model_revision":None,"calibration_status":"not_calibrated"},"abstention_reasons":abstentions,"drowsiness_indicator":drowsiness_indicator}
         # Legacy V2 fields remain null-only; the versioned extension is additive.
         # Scientific result status remains insufficient_evidence until a guarded,
         # independently validated model is active and its result contract evolves.
-        analysis_status="insufficient_evidence"
+        analysis_status=rule_indicator["analysis_status"]
         event(logger,"model.invocation.completed",processing_stage="model_invocation",scan_id=scan_id,tenant_ref=tenant_ref,error_code=prediction_extension.inference_status)
-        return AnalysisResult(status=analysis_status,scan_id=scan_id,targets={"reference_sleepiness":TargetOutput(),"vigilance_impairment":TargetOutput()},measurements=measurements,behavioral_evidence=behavioral_evidence,prediction_extension=prediction_extension,subjective_reference=subjective_reference,evidence=evidence,drowsiness_indicator=drowsiness_indicator,features=features,quality=qualities,message="Descriptive media feature extraction completed; fatigue prediction is not enabled.").model_dump(mode="json")
+        messages={
+            "disabled":"Media processing completed; model inference is disabled, so no prediction was performed.",
+            "available":"Media processing completed; target predictions are available in prediction_extension, but this contract does not provide a readiness category.",
+            "partial":"Media processing completed; predictions are available for only some targets, while other targets are unavailable or abstained.",
+            "abstained":"Media processing completed; inference did not produce usable target predictions.",
+        }
+        return AnalysisResult(status="insufficient_evidence",scan_id=scan_id,targets={"reference_sleepiness":TargetOutput(),"vigilance_impairment":TargetOutput()},measurements=measurements,behavioral_evidence=behavioral_evidence,prediction_extension=prediction_extension,subjective_reference=subjective_reference,evidence=evidence,drowsiness_indicator=drowsiness_indicator,analysis_status=rule_indicator["analysis_status"],prediction=rule_indicator["prediction"],confidence_level=rule_indicator["confidence_level"],risk_level=rule_indicator["risk_level"],engine_type=rule_indicator["engine_type"],contributing_indicators=rule_indicator["contributing_indicators"],insufficient_evidence_reason=rule_indicator["insufficient_evidence_reason"],features=features,quality=qualities,message=messages[prediction_extension.inference_status]).model_dump(mode="json")

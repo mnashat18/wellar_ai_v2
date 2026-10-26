@@ -87,6 +87,8 @@ class Settings:
     model_artifact_dir: str | None = None
     research_image_drowsiness_enabled: bool = False
     research_image_drowsiness_artifact_dir: str | None = None
+    rate_limit_per_minute: int = 120
+    cors_origins: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -166,6 +168,8 @@ class Settings:
                 model_artifact_dir=os.getenv("WELLAR_MODEL_ARTIFACT_DIR"),
                 research_image_drowsiness_enabled=_env_bool("WELLAR_RESEARCH_IMAGE_DROWSINESS_ENABLED",False),
                 research_image_drowsiness_artifact_dir=os.getenv("WELLAR_RESEARCH_IMAGE_DROWSINESS_ARTIFACT_DIR"),
+                rate_limit_per_minute=int(os.getenv("WELLAR_RATE_LIMIT_PER_MINUTE", "120")),
+                cors_origins=tuple(x.strip().rstrip("/") for x in os.getenv("WELLAR_CORS_ORIGINS", "").split(",") if x.strip()),
             )
         except ValueError as exc:
             raise ValueError("invalid Wellar environment configuration") from exc
@@ -177,6 +181,18 @@ class Settings:
             raise ValueError("WELLAR_ENV must be development, test, staging, or production")
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("WELLAR_LOG_LEVEL is invalid")
+        if self.environment in {"staging", "production"} and self.log_level == "DEBUG":
+            raise ValueError("WELLAR_LOG_LEVEL=DEBUG is not allowed in staging/production")
+        if not 1 <= self.rate_limit_per_minute <= 100000:
+            raise ValueError("WELLAR_RATE_LIMIT_PER_MINUTE must be between 1 and 100000")
+        for origin in self.cors_origins:
+            parsed_origin = urlparse(origin)
+            if (parsed_origin.scheme not in {"http", "https"} or not parsed_origin.netloc
+                    or parsed_origin.path or parsed_origin.query or parsed_origin.fragment
+                    or parsed_origin.username or parsed_origin.password or "*" in origin):
+                raise ValueError("WELLAR_CORS_ORIGINS must contain explicit HTTP(S) origins without paths or wildcards")
+            if self.environment in {"staging", "production"} and parsed_origin.scheme != "https":
+                raise ValueError("WELLAR_CORS_ORIGINS must use HTTPS in staging/production")
         if min(self.queue_capacity, self.worker_count, self.max_attempts, self.lease_seconds) < 1 or self.retry_base_seconds <= 0:
             raise ValueError("queue capacity, worker count, attempts, lease and retry values must be positive")
         if min(self.max_video_bytes,self.max_image_bytes,self.max_audio_bytes,self.max_video_seconds,self.max_audio_seconds,self.max_image_pixels,self.max_video_frames,self.max_media_total_bytes,self.max_media_per_tenant_bytes,self.max_concurrent_uploads,self.media_retention_days) < 1 or self.video_sample_hz <= 0:
@@ -212,6 +228,8 @@ class Settings:
             raise ValueError("the research image drowsiness model is restricted to development/test")
         if self.research_image_drowsiness_enabled and not self.research_image_drowsiness_artifact_dir:
             raise ValueError("WELLAR_RESEARCH_IMAGE_DROWSINESS_ARTIFACT_DIR is required when research image inference is enabled")
+        if self.environment in {"staging", "production"} and self.model_inference_enabled:
+            raise ValueError("WELLAR_MODEL_INFERENCE_ENABLED must remain false in staging/production until an approved model release exists")
         if self.auth_mode=="oidc" and not all((self.oidc_issuer,self.oidc_audience,self.oidc_jwks_uri)):
             raise ValueError("OIDC issuer, audience and JWKS URI are required")
         if self.auth_mode=="directus":

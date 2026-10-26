@@ -124,6 +124,13 @@ class ScanResult(BaseModel):
     subjective_reference: dict[str, str | int | bool] | None = None
     evidence: dict[str, object] | None = None
     drowsiness_indicator: dict[str, object] | None = None
+    analysis_status: str | None = None
+    prediction: str | None = None
+    confidence_level: str | None = None
+    risk_level: str | None = None
+    engine_type: str | None = None
+    contributing_indicators: list[str] = Field(default_factory=list)
+    insufficient_evidence_reason: str | None = None
     quality: dict[str, object] = Field(default_factory=dict)
     features: dict[str, object] = Field(default_factory=dict)
     message: str

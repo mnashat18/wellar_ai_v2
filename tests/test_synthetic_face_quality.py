@@ -31,9 +31,9 @@ def test_synthetic_face_normal_and_low_light_quality_are_repeatable(tmp_path):
     mesh=_face_mesh_factory(static_image_mode=True)
     try:
         detected=mesh.process(normal_rgb).multi_face_landmarks
-        assert detected and len(detected[0].landmark)>=468
+        assert detected and len(detected[0].landmark)>=478
         low_detected=mesh.process(low_rgb).multi_face_landmarks
-        assert low_detected and len(low_detected[0].landmark)>=468
+        assert low_detected and len(low_detected[0].landmark)>=478
 
         normal=extract_image(normal_path,max_pixels=4_000_000,face_mesh=mesh)
         normal_repeat=extract_image(normal_path,max_pixels=4_000_000,face_mesh=mesh)
@@ -136,6 +136,30 @@ def test_real_extractor_detects_blur_and_missing_landmark_branch(tmp_path):
     assert missing["features"]["eye_aspect_ratio"] is None
 
 
+def test_face_mesh_factory_enables_refined_iris_landmarks(monkeypatch):
+    calls=[]
+    def face_mesh(**kwargs):
+        calls.append(kwargs)
+        return object()
+    fake_mediapipe=SimpleNamespace(solutions=SimpleNamespace(
+        face_mesh=SimpleNamespace(FaceMesh=face_mesh)))
+    monkeypatch.setitem(__import__("sys").modules,"mediapipe",fake_mediapipe)
+
+    _face_mesh_factory(static_image_mode=False)
+
+    assert calls==[{
+        "static_image_mode":False,"max_num_faces":2,"refine_landmarks":True,
+        "min_detection_confidence":.5,"min_tracking_confidence":.5,
+    }]
+
+
+def test_p80_rejects_landmark_lists_without_iris_points():
+    from app.media.extractors import _p80_features
+
+    assert _p80_features([SimpleNamespace(x=.5,y=.5)]*477)==(
+        None,None,None,"iris_landmarks_unavailable")
+
+
 def test_worker_propagates_low_light_quality_without_fatigue_prediction(client,auth,tmp_path):
     path=tmp_path/"synthetic-face-low.png"
     path.write_bytes(synthetic_face_image_bytes(brightness=.08))
@@ -156,6 +180,5 @@ def test_worker_propagates_low_light_quality_without_fatigue_prediction(client,a
     assert image["features"]["eye_aspect_ratio"] is not None
     assert result["status"]=="insufficient_evidence"
     assert all(target["value"] is None for target in result["targets"].values())
-    assert result["drowsiness_indicator"]["status"]=="not_performed"
-    assert result["drowsiness_indicator"]["production_prediction"] is False
+    assert result["analysis_status"]=="retake_required" and result["prediction"] is None
     assert client.app.state.media_store.resolve(ref,"tenant-a","user-a") is None

@@ -11,15 +11,15 @@ from pathlib import Path
 
 
 class DecodeTimeoutError(TimeoutError):
-    pass
+    error_code = "decode_timeout"
 
 
 class DecodeMemoryLimitError(MemoryError):
-    pass
+    error_code = "decode_memory_limit"
 
 
 class DecodeChildError(RuntimeError):
-    pass
+    error_code = "decode_worker_failed"
 
 
 def _decode_media(modality: str, path: str, limits: dict):

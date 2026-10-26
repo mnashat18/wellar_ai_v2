@@ -14,6 +14,8 @@ from app.observability.metrics import worker_metrics
 from app.drowsiness_indicator import classify as classify_drowsiness
 from app.measurements.dual_output import dual_measurement_output
 from app.behavioral.engine import build_behavioral_evidence
+from app.media.contracts import PredictionExtension, VersionedTargetPrediction
+from app.ml.runtime import TARGETS
 from app.media.reconciliation import MediaReconciler,delete_with_retry
 
 logger=logging.getLogger("wellar.worker")
@@ -31,9 +33,14 @@ def research_only_processor(payload: dict) -> dict:
             "collection_consent": True,
         }
     measurements=dual_measurement_output(None, legacy_reference=legacy_reference)
+    prediction_extension=PredictionExtension(inference_status="disabled",targets={
+        target:VersionedTargetPrediction(status="unavailable",quality_status="not_evaluated",
+            abstention_reason="prediction_not_enabled") for target in sorted(TARGETS)
+    })
     return {
         "status": "insufficient_evidence",
         "model_version": None,
+        "prediction_extension": prediction_extension.model_dump(mode="json"),
         "targets": {
             "reference_sleepiness": {"status":"unavailable","value":None},
             "vigilance_impairment": {"status":"unavailable","value":None},
@@ -42,13 +49,14 @@ def research_only_processor(payload: dict) -> dict:
         "behavioral_evidence": build_behavioral_evidence({}, measurements),
         "drowsiness_indicator": classify_drowsiness({}),
         "quality": {"video":"not_processed","image":"not_processed","audio":"not_processed","reaction_task":"not_provided"},
-        "message": "No authorized, validated analysis pipeline is configured.",
+        "message": "Media processing completed; model inference is disabled, so no prediction was performed.",
     }
 
 
 class Worker:
-    def __init__(self, store, worker_id: str, processor: Callable[[dict],dict]=research_only_processor, *, reconciliation_page_size: int=50, reconciliation_max_pages: int=5, reconciliation_max_references: int=500, reconciliation_lease_seconds: int=300, reconciliation_delete_attempts:int=3,reconciliation_delete_retry_deadline_seconds:float=16.0,reconciliation_retry_initial_seconds:float=1.0,reconciliation_retry_multiplier:float=2.0,reconciliation_retry_max_seconds:float=300.0,reconciliation_retry_jitter:float=0.2,reconciliation_stop_event=None):
+    def __init__(self, store, worker_id: str, processor: Callable[[dict],dict]=research_only_processor, *, directus_publisher=None, reconciliation_page_size: int=50, reconciliation_max_pages: int=5, reconciliation_max_references: int=500, reconciliation_lease_seconds: int=300, reconciliation_delete_attempts:int=3,reconciliation_delete_retry_deadline_seconds:float=16.0,reconciliation_retry_initial_seconds:float=1.0,reconciliation_retry_multiplier:float=2.0,reconciliation_retry_max_seconds:float=300.0,reconciliation_retry_jitter:float=0.2,reconciliation_stop_event=None):
         self.store,self.worker_id,self.processor=store,worker_id,processor
+        self.directus_publisher=directus_publisher
         media_store=getattr(processor,"media_store",None)
         self.reconciler=MediaReconciler(media_store,store,page_size=reconciliation_page_size,max_pages_per_run=reconciliation_max_pages,max_references_per_run=reconciliation_max_references,lease_seconds=reconciliation_lease_seconds,delete_attempts=reconciliation_delete_attempts,delete_retry_deadline_seconds=reconciliation_delete_retry_deadline_seconds) if media_store is not None and callable(getattr(store,"list_terminal_scan_media_refs",None)) else None
         self._last_reconciliation=0.0
@@ -129,7 +137,9 @@ class Worker:
 
     def run_once(self) -> bool:
         job=self.store.claim(self.worker_id)
-        if not job: return False
+        if not job:
+            self._publish_directus_once()
+            return False
         request_token=request_id_var.set(job.get("request_id","-"))
         try:
             payload=__import__("json").loads(job["payload_json"]);payload_parse_error=False
@@ -210,6 +220,7 @@ class Worker:
             event(logger,"scan.processing.stage_completed",processing_stage="result_commit",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,duration_ms=round((time.perf_counter()-persistence_started)*1000,3))
             event(logger,"scan.processing.completed",scan_id=job["scan_id"],job_id=job["job_id"],worker_id=self.worker_id,tenant_ref=tenant_ref,processing_stage="result_commit",duration_ms=round((time.perf_counter()-start)*1000,3),attempt=job["attempts"])
             worker_metrics.increment("stage","result_commit"); worker_metrics.increment("outcome","success")
+            self._publish_directus_once()
         except Exception as exc:
             span.set_attribute("error",True)
             heartbeat_stop.set(); heartbeat_thread.join()
@@ -265,3 +276,12 @@ class Worker:
                     wait_seconds=min(wait_seconds,max(0.0,self._next_reconciliation_at-time.monotonic()))
                 wait_seconds=min(wait_seconds,max(0.0,self._next_directus_reconciliation_at-time.monotonic()))
                 stop_event.wait(wait_seconds)
+
+    def _publish_directus_once(self):
+        if self.directus_publisher is None:return
+        try:
+            outcome=self.directus_publisher.run_once(self.worker_id)
+            if outcome not in {"idle","delivered"}:
+                event(logger,"directus.result_write.retry",logging.WARNING,processing_stage="directus_writeback",error_code=outcome)
+        except Exception as exc:
+            event(logger,"directus.result_write.retry",logging.WARNING,processing_stage="directus_writeback",error_code="directus_sync_failed",exception_type=type(exc).__name__)

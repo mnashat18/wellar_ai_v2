@@ -14,6 +14,7 @@ from app.core.logging import configure_logging,event
 from app.core.adapters import create_analysis_processor,create_media_store,create_queue_store
 from app.workers.worker import Worker
 from app.compat.directus_facade import DirectusHTTPClient,DirectusPullProcessor
+from app.rule_based_indicators import load_config as load_rule_indicator_config
 
 
 def readiness_marker_path(pid: int | None=None) -> Path:
@@ -22,6 +23,7 @@ def readiness_marker_path(pid: int | None=None) -> Path:
 
 def main() -> None:
     settings=Settings.from_env()
+    settings.validate()
     configure_logging(settings.log_level,settings.environment)
     logger=logging.getLogger("wellar.worker")
     stop=threading.Event()
@@ -35,8 +37,13 @@ def main() -> None:
     try:
         # Import native runtimes before Worker starts lease-heartbeat threads.
         import numpy  # noqa: F401
+        import cv2  # noqa: F401
+        import mediapipe  # noqa: F401
+        load_rule_indicator_config()
         store=create_queue_store(settings)
         media_store=create_media_store(settings,store)
+        if settings.media_backend=="s3" and not media_store.readiness():
+            raise RuntimeError("S3 bucket is not accessible; verify bucket name, endpoint, credentials and bucket permissions")
         # Stage 1 runs media feature extraction only; no prediction artifacts load.
         processor=create_analysis_processor(settings,media_store)
         processor.warmup()

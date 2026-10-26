@@ -57,6 +57,121 @@ def _mouth_aspect_ratio(landmarks):
     return ratio if math.isfinite(ratio) and 0<=ratio<=2 else None
 
 
+def _p80_features(landmarks):
+    """Estimate eye aperture against iris diameter using refined Face Mesh points.
+
+    This geometric approximation is a P80 *proxy*: it is not an instrumented
+    pupil-occlusion measurement and must not be presented as validated PERCLOS.
+    """
+    # Iris points 468-477 are available only with Face Mesh refine_landmarks.
+    # Fail explicitly before indexing so an unrefined/malformed mesh cannot
+    # silently produce a partial P80 feature.
+    try:
+        if len(landmarks) < 478:
+            return None, None, None, "iris_landmarks_unavailable"
+    except (TypeError, AttributeError):
+        return None, None, None, "iris_landmarks_unavailable"
+    import numpy as np
+    try:
+        eyes = ((159, 145, 470, 472, 468, 33, 133),
+                (386, 374, 475, 477, 473, 362, 263))
+        closure, gaze_x, gaze_y = [], [], []
+        for upper, lower, iris_top, iris_bottom, iris_center, outer, inner in eyes:
+            p = np.asarray([(landmarks[i].x, landmarks[i].y)
+                            for i in (upper, lower, iris_top, iris_bottom, iris_center, outer, inner)], dtype=np.float64)
+            if p.shape != (7, 2) or not np.isfinite(p).all():
+                return None, None, None
+            iris_diameter = float(np.linalg.norm(p[2] - p[3]))
+            eye_width = float(np.linalg.norm(p[5] - p[6]))
+            if iris_diameter <= 1e-5 or eye_width <= 1e-5:
+                return None, None, None
+            aperture = float(np.linalg.norm(p[0] - p[1])) / iris_diameter
+            closure.append(max(0.0, min(1.0, 1.0 - aperture)))
+            gaze_x.append(float((p[4, 0] - (p[5, 0] + p[6, 0]) / 2) / eye_width))
+            gaze_y.append(float((p[4, 1] - (p[0, 1] + p[1, 1]) / 2) / iris_diameter))
+        return sum(closure) / len(closure), sum(gaze_x) / len(gaze_x), sum(gaze_y) / len(gaze_y), None
+    except (IndexError, TypeError, AttributeError, ValueError, FloatingPointError):
+        return None, None, None, "invalid_iris_landmarks"
+
+
+def _rule_temporal_features(observations, duration, config):
+    """Aggregate time-based indicator proxies under continuous face visibility."""
+    import statistics
+    total = closed = 0.0
+    eye_runs, mouth_runs = [], []
+    eye_start = mouth_start = None
+    max_gap = max(float(config["maximum_observation_gap_seconds_minimum"]),
+                  float(config["maximum_observation_gap_sample_periods"]) / max(0.1, float(config.get("sample_hz", 4.0))))
+    for current, following in zip(observations, observations[1:]):
+        gap = following["timestamp_seconds"] - current["timestamp_seconds"]
+        continuous = (0 < gap <= max_gap and current.get("continuity_to_next", True)
+                      and current.get("face_valid") and following.get("face_valid"))
+        if not continuous:
+            if eye_start is not None: eye_runs.append(current["timestamp_seconds"] - eye_start)
+            if mouth_start is not None: mouth_runs.append(current["timestamp_seconds"] - mouth_start)
+            eye_start = mouth_start = None
+            continue
+        if current.get("closed_p80") is None or following.get("closed_p80") is None:
+            if eye_start is not None: eye_runs.append(current["timestamp_seconds"] - eye_start)
+            eye_start = None
+            continue
+        total += gap
+        p80_closed = current.get("closed_p80") is True
+        if p80_closed: closed += gap
+        if p80_closed and eye_start is None: eye_start = current["timestamp_seconds"]
+        if eye_start is not None and not following.get("closed_p80"):
+            eye_runs.append(following["timestamp_seconds"] - eye_start)
+            eye_start = None
+        mouth_open = current.get("mouth_open") is True
+        if mouth_open and mouth_start is None: mouth_start = current["timestamp_seconds"]
+        if mouth_start is not None and not following.get("mouth_open"):
+            mouth_runs.append(following["timestamp_seconds"] - mouth_start)
+            mouth_start = None
+    if observations:
+        last = observations[-1]["timestamp_seconds"]
+        if eye_start is not None: eye_runs.append(last - eye_start)
+        if mouth_start is not None: mouth_runs.append(last - mouth_start)
+    blink_min = float(config["blink_min_seconds"]); blink_max = float(config["blink_max_seconds"])
+    microsleep_min = float(config["microsleep_min_seconds_exclusive"])
+    yawn_min = float(config["yawn_min_seconds"]); yawn_max = float(config["yawn_max_seconds"])
+    pitches = [o["pitch_proxy"] for o in observations if o.get("face_valid") and isinstance(o.get("pitch_proxy"), (int, float))]
+    pitch_center = statistics.median(pitches) if pitches else 0.0
+    nods = []
+    nod_start = None
+    for current, following in zip(observations, observations[1:]):
+        gap = following["timestamp_seconds"] - current["timestamp_seconds"]
+        active = (0 < gap <= max_gap and current.get("face_valid") and following.get("face_valid")
+                  and current.get("continuity_to_next", True)
+                  and isinstance(current.get("pitch_proxy"), (int, float))
+                  and current["pitch_proxy"] - pitch_center >= float(config["head_nod_pitch_excursion"]))
+        if active and nod_start is None: nod_start = current["timestamp_seconds"]
+        if nod_start is not None and not active:
+            nods.append(current["timestamp_seconds"] - nod_start); nod_start = None
+    if nod_start is not None and observations: nods.append(observations[-1]["timestamp_seconds"] - nod_start)
+    gaze = [(o.get("gaze_x_proxy"), o.get("gaze_y_proxy")) for o in observations
+            if o.get("face_valid") and isinstance(o.get("gaze_x_proxy"), (int, float))
+            and isinstance(o.get("gaze_y_proxy"), (int, float))]
+    pose = [(o.get("yaw_proxy"), o.get("pitch_proxy")) for o in observations
+            if o.get("face_valid") and isinstance(o.get("yaw_proxy"), (int, float))
+            and isinstance(o.get("pitch_proxy"), (int, float))]
+    variability = lambda pairs: (statistics.pstdev([x[0] for x in pairs]) + statistics.pstdev([x[1] for x in pairs])) / 2 if len(pairs) > 1 else 0.0
+    return {
+        "perclos_p80": closed / total if total > 0 else None,
+        "perclos_p80_definition": "fraction_of_observed_time_estimated_eyelid_coverage_at_least_configured_80_percent_proxy",
+        "blink_count": sum(blink_min <= d <= blink_max for d in eye_runs),
+        "blink_rate_per_minute": sum(blink_min <= d <= blink_max for d in eye_runs) / (total / 60) if total > 0 else None,
+        "mean_blink_duration_seconds": (sum(d for d in eye_runs if blink_min <= d <= blink_max) / max(1, sum(blink_min <= d <= blink_max))) if any(blink_min <= d <= blink_max for d in eye_runs) else 0.0,
+        "microsleep_count": sum(d > microsleep_min for d in eye_runs),
+        "prolonged_eye_closure_count": sum(d > blink_max for d in eye_runs),
+        "yawn_count": sum(yawn_min <= d <= yawn_max for d in mouth_runs),
+        "yawn_count_estimate": sum(yawn_min <= d <= yawn_max for d in mouth_runs),
+        "head_nod_count": sum(d >= float(config["head_nod_min_seconds"]) for d in nods),
+        "gaze_variability": variability(gaze), "head_pose_variability": variability(pose),
+        "face_detection_ratio": sum(bool(o.get("face_valid")) for o in observations) / len(observations) if observations else 0.0,
+        "frame_count": len(observations), "temporal_coverage": total / duration if duration > 0 else 0.0,
+    }
+
+
 def _pose_proxy(landmarks):
     """Coarse normalized face-orientation proxy; not a calibrated pose estimate."""
     try:
@@ -210,6 +325,8 @@ def temporal_eye_features(observations: list[dict],duration: float,sampling_hz: 
 
 def extract_video(path: Path, *, max_seconds: int, max_frames: int, sample_hz: float, max_pixels: int, face_mesh=None, face_mesh_provider=None, include_sample_features: bool=False)->dict:
     import cv2
+    from app.rule_based_indicators import load_config as load_indicator_config
+    indicator_config=load_indicator_config()
     started=time.perf_counter(); capture=cv2.VideoCapture(str(path)); mesh=face_mesh; owns_mesh=mesh is None and face_mesh_provider is None
     try:
         if not capture.isOpened(): raise InvalidMediaError("video_decode_failed")
@@ -236,8 +353,9 @@ def extract_video(path: Path, *, max_seconds: int, max_frames: int, sample_hz: f
             left=_ear(lm,_LEFT_EYE) if lm is not None else None; right=_ear(lm,_RIGHT_EYE) if lm is not None else None
             mouth_ratio=_mouth_aspect_ratio(lm) if lm is not None else None
             yaw_proxy,pitch_proxy=_pose_proxy(lm) if lm is not None else (None,None)
+            pupil_coverage,gaze_x_proxy,gaze_y_proxy,p80_reason_code=_p80_features(lm) if lm is not None else (None,None,None,None)
             valid=left is not None and right is not None; ear=(left+right)/2 if valid else None
-            observations.append({"frame_index":i,"timestamp_seconds":i/fps,"face_count":face_count,"face_valid":valid,"face_bounds":_face_bounds(lm) if lm is not None else None,"closed":ear is not None and ear<=.16 if valid else None,"eye_aspect_ratio":ear,"mouth_aspect_ratio":mouth_ratio,"mouth_open":mouth_ratio is not None and mouth_ratio>=.55,"yaw_proxy":yaw_proxy,"pitch_proxy":pitch_proxy})
+            observations.append({"frame_index":i,"timestamp_seconds":i/fps,"face_count":face_count,"face_valid":valid,"face_bounds":_face_bounds(lm) if lm is not None else None,"closed":ear is not None and ear<=.16 if valid else None,"pupil_coverage_proxy":pupil_coverage,"p80_reason_code":p80_reason_code,"closed_p80":pupil_coverage is not None and pupil_coverage>=indicator_config["p80_pupil_coverage"],"eye_aspect_ratio":ear,"mouth_aspect_ratio":mouth_ratio,"mouth_open":mouth_ratio is not None and mouth_ratio>=indicator_config["yawn_mouth_aspect_ratio"],"yaw_proxy":yaw_proxy,"pitch_proxy":pitch_proxy,"gaze_x_proxy":gaze_x_proxy,"gaze_y_proxy":gaze_y_proxy})
         track_gap_limit=max(.5,2.0/sample_hz)
         continuity_established=bool(observations) and all(o["face_count"]==1 and o["face_valid"] and o["face_bounds"] is not None for o in observations)
         for previous,current in zip(observations,observations[1:]):
@@ -245,11 +363,12 @@ def extract_video(path: Path, *, max_seconds: int, max_frames: int, sample_hz: f
             same_track=0<gap<=track_gap_limit and _same_spatial_track(previous.get("face_bounds"),current.get("face_bounds"))
             previous["continuity_to_next"]=same_track
             continuity_established=continuity_established and same_track
-        temporal=temporal_eye_features(observations,duration,actual_hz); temporal["video_duration_seconds"]=duration; temporal["actual_sample_hz"]=actual_hz; face_count=temporal["valid_face_count"]
+        temporal=temporal_eye_features(observations,duration,actual_hz); temporal.update(_rule_temporal_features(observations,duration,{**indicator_config,"sample_hz":actual_hz})); temporal["video_duration_seconds"]=duration; temporal["actual_sample_hz"]=actual_hz; face_count=temporal["valid_face_count"]
+        temporal["p80_reason_code"]=next((o["p80_reason_code"] for o in observations if o.get("p80_reason_code")),None)
         if not continuity_established:
             # Do not pool eye/mouth events across gaps, face loss, multi-face
             # frames, or spatially discontinuous detections.
-            for key in ("median_eye_aspect_ratio","median_mouth_aspect_ratio","closure_event_count","blink_event_count","blink_rate_per_minute","closure_duration_mean_seconds","closure_duration_max_seconds","sampled_closed_fraction","short_clip_eye_closure_fraction","short_eye_closure_fraction","observed_eye_closure_fraction","yaw_proxy","pitch_proxy","mouth_open_event_count","mouth_open_event_duration_mean_seconds","sampled_mouth_open_fraction"):
+            for key in ("median_eye_aspect_ratio","median_mouth_aspect_ratio","closure_event_count","blink_event_count","blink_rate_per_minute","closure_duration_mean_seconds","closure_duration_max_seconds","sampled_closed_fraction","short_clip_eye_closure_fraction","short_eye_closure_fraction","observed_eye_closure_fraction","yaw_proxy","pitch_proxy","mouth_open_event_count","mouth_open_event_duration_mean_seconds","sampled_mouth_open_fraction","perclos_p80","blink_count","microsleep_count","prolonged_eye_closure_count","yawn_count","yawn_count_estimate","head_nod_count","gaze_variability","head_pose_variability"):
                 temporal[key]=None
             temporal["short_eye_feature_status"]="face_track_continuity_unestablished"
         temporal["face_track_continuity_status"]="spatial_continuity_established" if continuity_established else "unestablished"
@@ -265,7 +384,9 @@ def extract_video(path: Path, *, max_seconds: int, max_frames: int, sample_hz: f
         available=enough_temporal_samples and enough_coverage and continuity_established and not low_light and not low_blur and not multiple_faces
         reason=None if available else ("multiple_faces_detected" if multiple_faces else "face_not_detected" if face_count==0 else "face_track_continuity_unestablished" if not continuity_established else "insufficient_temporal_samples" if not enough_temporal_samples else "insufficient_temporal_coverage" if not enough_coverage else "low_light" if low_light else "blurred_image")
         temporal["mean_sampled_luminance"]=(sum(light_values)/len(light_values)) if light_values else None
+        temporal["mean_luminance"]=temporal["mean_sampled_luminance"]
         temporal["mean_blur_variance"]=(sum(blur_values)/len(blur_values)) if blur_values else None
+        temporal["frame_count_decoded"]=frames_read
         temporal["multiple_faces_detected"]=multiple_faces
         temporal["face_track_continuity_rule"]="consecutive_sampled_single_face_landmark_boxes_with_center_shift_le_0.55_face_diagonals_scale_ratio_le_2_and_gap_le_max_0.5s_or_2_sample_periods_not_identity_verification"
         temporal["blur_quality"]="blurred" if low_blur else "sufficient_sharpness_for_extraction"

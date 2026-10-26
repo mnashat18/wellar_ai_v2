@@ -111,8 +111,10 @@ def test_decode_timeout_releases_worker_lease_and_deletes_media(store,tmp_path,m
         max_video_frames=100,video_sample_hz=3,decode_timeout_seconds=.2,decode_memory_limit_mb=128)
     monkeypatch.setattr("app.media.analysis.run_killable",lambda *args,**kwargs: (_ for _ in ()).throw(DecodeTimeoutError("synthetic timeout")))
     assert Worker(store,"timeout-worker",processor).run_once()
-    assert store.db.execute("SELECT status FROM jobs WHERE scan_id='scan-timeout'").fetchone()[0]=="queued"
-    # Retryable decoder timeouts retain native media for the next attempt.
-    assert not media.deleted
+    assert store.db.execute("SELECT status FROM jobs WHERE scan_id='scan-timeout'").fetchone()[0]=="completed"
+    result=store.get_result("scan-timeout","tenant-a","subject-a")
+    assert result["analysis_status"]=="retake_required" and result["prediction"] is None
+    # The terminal retake result is persisted before native media cleanup.
+    assert media.deleted
     processor.close()
 

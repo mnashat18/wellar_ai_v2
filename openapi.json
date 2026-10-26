@@ -403,6 +403,17 @@
       },
       "ScanResult": {
         "properties": {
+          "analysis_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Analysis Status"
+          },
           "behavioral_evidence": {
             "anyOf": [
               {
@@ -415,6 +426,24 @@
             ],
             "title": "Behavioral Evidence"
           },
+          "confidence_level": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence Level"
+          },
+          "contributing_indicators": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Contributing Indicators",
+            "type": "array"
+          },
           "drowsiness_indicator": {
             "anyOf": [
               {
@@ -426,6 +455,17 @@
               }
             ],
             "title": "Drowsiness Indicator"
+          },
+          "engine_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine Type"
           },
           "evidence": {
             "anyOf": [
@@ -443,6 +483,17 @@
             "additionalProperties": true,
             "title": "Features",
             "type": "object"
+          },
+          "insufficient_evidence_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Insufficient Evidence Reason"
           },
           "measurements": {
             "additionalProperties": true,
@@ -469,6 +520,17 @@
             ],
             "title": "Model Version"
           },
+          "prediction": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prediction"
+          },
           "prediction_extension": {
             "anyOf": [
               {
@@ -485,6 +547,17 @@
             "additionalProperties": true,
             "title": "Quality",
             "type": "object"
+          },
+          "risk_level": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Risk Level"
           },
           "scan_id": {
             "title": "Scan Id",
@@ -583,6 +656,19 @@
               }
             ]
           },
+            "directus_scan_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Directus Scan Id"
+            },
           "media_refs": {
             "items": {
               "type": "string"
