@@ -326,8 +326,17 @@ def test_real_v2_sample_payload_values_match_scan_results_column_types():
     source=result(str(uuid.uuid4()))
     source["drowsiness_indicator"]["risk_level"]="stable"
     source["drowsiness_indicator"]["baseline"]["used"]=False
+    source["features"]={"video":{"features":{"face_detection_ratio":0.875}},
+        "audio":{"features":{"duration_seconds":12.5,"rms_dbfs":-22.4,"peak_dbfs":-3.1,
+            "speech_like_window_fraction":0.4,"voice_activity_window_fraction":0.35,
+            "clipped_sample_fraction":0.01}}}
     payload=build_directus_v2_result_contract_v1(source,str(uuid.uuid4()))
     assert payload["confidence"]==0.3
+    assert payload["camera_confidence"]==0.875
+    assert payload["voice_confidence"]==0.35
+    assert payload["voice_metrics"]=={"duration_seconds":12.5,"rms_dbfs":-22.4,"peak_dbfs":-3.1,
+        "speech_like_window_fraction":0.4,"voice_activity_window_fraction":0.35,"clipped_sample_fraction":0.01}
+    assert payload["readiness_score"] is None and payload["task_performance_score"] is None
     assert validate_scan_result_payload(payload)==payload
     for field in NUMERIC_FIELDS:
         value=payload.get(field)
@@ -354,6 +363,14 @@ def test_real_v2_sample_payload_values_match_scan_results_column_types():
     oversized_internal={**unknown_payload,"internal_analysis":"{"+"x"*300+"}"}
     normalized=validate_scan_result_payload(oversized_internal)
     assert normalized["internal_analysis"] is None
+
+
+def test_v2_result_without_audio_or_video_features_has_no_confidence_or_voice_metrics():
+    import uuid
+    payload=build_directus_v2_result_contract_v1(result(str(uuid.uuid4())),str(uuid.uuid4()))
+    assert payload["camera_confidence"] is None
+    assert payload["voice_confidence"] is None
+    assert payload["voice_metrics"] is None
 
 
 def test_result_writer_upserts_same_directus_row_on_repeated_delivery():
