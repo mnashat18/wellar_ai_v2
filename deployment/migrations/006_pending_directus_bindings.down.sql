@@ -1,0 +1,3 @@
+DELETE FROM directus_scan_bindings WHERE media_owner_verified=false;
+ALTER TABLE directus_scan_bindings
+  ADD CONSTRAINT directus_scan_bindings_media_owner_verified_check CHECK (media_owner_verified);

@@ -41,6 +41,7 @@ class ReactionTrial(BaseModel):
 class ScanSubmission(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: str = "1.0"
+    directus_scan_id: str | None = Field(default=None, min_length=1, max_length=256)
     media_refs: list[str] = Field(default_factory=list, max_length=8)
     reaction_task: ReactionTask | None = None
     subjective_fatigue: "SubjectiveFatigue | None" = None

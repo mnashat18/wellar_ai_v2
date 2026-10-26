@@ -42,3 +42,11 @@ def test_media_reconciliation_checkpoint_migration_is_additive():
     assert "cycle_started_at" in up and "after_scan_id" in up
     assert "lease_owner" in up and "lease_until" in up
     assert "drop table media_reconciliation_state" in down
+
+
+def test_pending_scan_binding_migration_allows_unverified_directus_media():
+    root=Path(__file__).resolve().parents[1]/"deployment"/"migrations"
+    up=(root/"006_pending_directus_bindings.up.sql").read_text().lower()
+    down=(root/"006_pending_directus_bindings.down.sql").read_text().lower()
+    assert "drop constraint directus_scan_bindings_media_owner_verified_check" in up
+    assert "where media_owner_verified=false" in down

@@ -176,9 +176,22 @@ class SQLiteQueueStore:
           tenant_id TEXT NOT NULL, subject_id TEXT NOT NULL, remote_owner_id TEXT NOT NULL,
           remote_tenant_id TEXT NOT NULL, remote_scan_status TEXT NOT NULL,
           membership_active INTEGER NOT NULL CHECK(membership_active=1),
-          media_owner_verified INTEGER NOT NULL CHECK(media_owner_verified=1),
+          media_owner_verified INTEGER NOT NULL CHECK(media_owner_verified IN (0,1)),
           verification_version TEXT NOT NULL, verified_at REAL NOT NULL,
           FOREIGN KEY(scan_id,tenant_id,subject_id) REFERENCES scans(scan_id,tenant_id,subject_id))""")
+        binding_sql=self.db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='directus_scan_bindings'").fetchone()[0]
+        if "check(media_owner_verified=1)" in binding_sql.lower().replace(" ",""):
+            self.db.execute("ALTER TABLE directus_scan_bindings RENAME TO directus_scan_bindings_legacy")
+            self.db.execute("""CREATE TABLE directus_scan_bindings(
+              scan_id TEXT PRIMARY KEY, directus_scan_id TEXT NOT NULL UNIQUE,
+              tenant_id TEXT NOT NULL, subject_id TEXT NOT NULL, remote_owner_id TEXT NOT NULL,
+              remote_tenant_id TEXT NOT NULL, remote_scan_status TEXT NOT NULL,
+              membership_active INTEGER NOT NULL CHECK(membership_active=1),
+              media_owner_verified INTEGER NOT NULL CHECK(media_owner_verified IN (0,1)),
+              verification_version TEXT NOT NULL, verified_at REAL NOT NULL,
+              FOREIGN KEY(scan_id,tenant_id,subject_id) REFERENCES scans(scan_id,tenant_id,subject_id))""")
+            self.db.execute("INSERT INTO directus_scan_bindings SELECT * FROM directus_scan_bindings_legacy")
+            self.db.execute("DROP TABLE directus_scan_bindings_legacy")
 
     @_db_operation("submit", transaction=True)
     def submit(self, scan_id: str, principal, key: str, payload_hash: str, payload_json: str, request_id: str = "-"):
@@ -431,7 +444,7 @@ class SQLiteQueueStore:
                         self.db.execute("COMMIT")
                         return False
                     raise ValueError("V2 scan already has a different Directus binding")
-                self.db.execute("INSERT INTO directus_scan_bindings(scan_id,directus_scan_id,tenant_id,subject_id,remote_owner_id,remote_tenant_id,remote_scan_status,membership_active,media_owner_verified,verification_version,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(scan_id,directus_scan_id,tenant_id,subject_id,evidence.remote_owner_id,evidence.remote_tenant_id,evidence.remote_status,1,1,"directus-binding-v1",now))
+                self.db.execute("INSERT INTO directus_scan_bindings(scan_id,directus_scan_id,tenant_id,subject_id,remote_owner_id,remote_tenant_id,remote_scan_status,membership_active,media_owner_verified,verification_version,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(scan_id,directus_scan_id,tenant_id,subject_id,evidence.remote_owner_id,evidence.remote_tenant_id,evidence.remote_status,int(evidence.membership_active),int(evidence.media_owner_verified),"directus-binding-v1",now))
                 self.db.execute("COMMIT")
                 return True
             except sqlite3.IntegrityError:
@@ -571,7 +584,7 @@ class SQLiteQueueStore:
                 updated_at=time.time() if status=="failed" else now
                 self.db.execute("UPDATE scans SET status=?,updated_at=? WHERE scan_id=?",(status,updated_at,job["scan_id"]))
                 if status=="failed":
-                    self.db.execute("INSERT OR IGNORE INTO outbox(event_id,scan_id,event_type,payload_json,created_at,published_at,available_at) VALUES(?,?,?,?,?,NULL,?)",(new_id(),job["scan_id"],"scan.failed",json.dumps({"scan_id":job["scan_id"]}),now,now))
+                    self.db.execute("INSERT OR IGNORE INTO outbox(event_id,scan_id,event_type,payload_json,created_at,published_at,available_at) VALUES(?,?,?,?,?,NULL,?)",(new_id(),job["scan_id"],"scan.failed",json.dumps({"scan_id":job["scan_id"],"error_code":error_code[:80]}),now,now))
                 self.db.execute("COMMIT")
             except Exception:
                 self._rollback_safely()
