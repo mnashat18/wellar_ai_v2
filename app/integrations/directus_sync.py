@@ -68,13 +68,32 @@ def build_directus_v2_result_contract_v1(result: dict, directus_scan_id: str) ->
                             message if isinstance(message,str) else ""])
     baseline=indicator.get("baseline") if isinstance(indicator,dict) else None
     raw=indicator.get("raw_measurements") if isinstance(indicator,dict) else None
+    features=result.get("features") if isinstance(result,dict) else None
+    video=features.get("video") if isinstance(features,dict) else None
+    video_features=video.get("features") if isinstance(video,dict) else None
+    audio=features.get("audio") if isinstance(features,dict) else None
+    audio_features=audio.get("features") if isinstance(audio,dict) else None
+    def finite_number(value):
+        return value if isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) else None
+    camera_confidence=finite_number(video_features.get("face_detection_ratio")) if isinstance(video_features,dict) else None
+    if camera_confidence is not None and not 0<=camera_confidence<=1:
+        camera_confidence=None
+    # This is a heuristic activity fraction, not a validated confidence.
+    voice_confidence=finite_number(audio_features.get("voice_activity_window_fraction")) if isinstance(audio_features,dict) else None
+    voice_metric_fields=("duration_seconds","rms_dbfs","peak_dbfs","speech_like_window_fraction",
+                         "voice_activity_window_fraction","clipped_sample_fraction")
+    voice_metrics=({key:number for key in voice_metric_fields
+                    if (number:=finite_number(audio_features.get(key))) is not None}
+                   if isinstance(audio_features,dict) else None)
     return validate_scan_result_payload({"scan_id":directus_scan_id,"risk_level":risk,"confidence":confidence,
             "explanation":explanation or "Indicative, non-diagnostic result.",
             "suggested_action":{"stable":"Continue routine monitoring.","low_focus":"Consider a short break.",
                 "elevated_fatigue":"Take a break before continuing.","high_risk":"Stop the activity and rest."}[risk],
             "ai_model_version":indicator.get("model_version"),
             "baseline_used":bool(baseline.get("used")) if isinstance(baseline,dict) else False,
-            "face_metrics":raw if isinstance(raw,dict) else None,"readiness_score":None})
+            "face_metrics":raw if isinstance(raw,dict) else None,"readiness_score":None,
+            "camera_confidence":camera_confidence,"voice_confidence":voice_confidence,
+            "voice_metrics":voice_metrics or None,"task_performance_score":None})
 
 
 NUMERIC_MAX=99999.99999
